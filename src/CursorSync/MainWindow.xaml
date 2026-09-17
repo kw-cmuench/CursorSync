@@ -22,10 +22,16 @@
     </shell:WindowChrome.WindowChrome>
 
     <Grid>
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="248"/>
-            <ColumnDefinition Width="*"/>
-        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="248"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
 
         <Border Background="{StaticResource SidebarBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
             <Grid>
@@ -117,8 +123,6 @@
 
             <Border Background="{StaticResource BgBrush}" MouseLeftButtonDown="TitleBar_MouseLeftButtonDown">
                 <Grid>
-                    <TextBlock Text="{Binding StatusMessage}" Style="{StaticResource CaptionText}"
-                               VerticalAlignment="Center" Margin="28,0,0,0"/>
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                         <Button Style="{StaticResource WindowButton}" Click="Minimize_Click" ToolTip="Minimize"
                                 shell:WindowChrome.IsHitTestVisibleInChrome="True">
@@ -161,7 +165,7 @@
                 <TextBlock Text="{Binding BannerText}" TextWrapping="Wrap"/>
             </Border>
 
-            <Grid Grid.Row="2" Margin="28,18,16,16">
+            <Grid Grid.Row="2" Margin="28,18,16,8">
                 <views:DashboardPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Dashboard}"/>
                 <views:CategoriesPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Categories}"/>
                 <views:SyncPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Sync}"/>
@@ -170,7 +174,33 @@
             </Grid>
         </Grid>
 
-        <Border Grid.ColumnSpan="2" Background="#99000000"
+        </Grid>
+
+        <Border Grid.Row="1"
+                Background="{StaticResource SidebarBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,1,0,0"
+                Padding="16,7">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal">
+                    <ProgressBar Width="110" Height="4" Margin="0,0,12,0" VerticalAlignment="Center"
+                                 Minimum="0" Maximum="1"
+                                 Value="{Binding ProgressValue}"
+                                 IsIndeterminate="{Binding IsBusyIndeterminate}"
+                                 Visibility="{Binding IsBusy, Converter={StaticResource BoolToVis}}"/>
+                    <TextBlock Text="{Binding StatusBarText}" Style="{StaticResource CaptionText}" VerticalAlignment="Center"
+                               TextTrimming="CharacterEllipsis"/>
+                </StackPanel>
+                <TextBlock Grid.Column="1" Text="{Binding CursorStatusText}" Style="{StaticResource CaptionText}"
+                           VerticalAlignment="Center" Margin="16,0,0,0"/>
+            </Grid>
+        </Border>
+
+        <Border Grid.RowSpan="2" Background="#99000000"
                 Visibility="{Binding IsConfirmOpen, Converter={StaticResource BoolToVis}}">
             <Border Style="{StaticResource Card}" Width="440" Padding="22" HorizontalAlignment="Center" VerticalAlignment="Center">
                 <StackPanel>

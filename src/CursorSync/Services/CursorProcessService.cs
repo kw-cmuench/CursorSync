@@ -21,22 +21,7 @@ public static class CursorProcessService
 
     public static IReadOnlyList<Process> GetCursorProcesses()
     {
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "Cursor",
-            "Cursor Helper",
-            "Cursor Helper (GPU)",
-            "Cursor Helper (Renderer)",
-            "Cursor Helper (Plugin)"
-        };
-
-        return Process.GetProcesses()
-            .Where(p =>
-            {
-                try { return names.Contains(p.ProcessName); }
-                catch { return false; }
-            })
-            .ToList();
+        return Process.GetProcessesByName("Cursor");
     }
 
     public static async Task<bool> TryCloseAsync(TimeSpan timeout, CancellationToken cancellationToken)

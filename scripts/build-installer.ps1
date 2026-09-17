@@ -14,8 +14,8 @@ $iss = Join-Path $root "installer\CursorSync.iss"
 
 function Find-Iscc {
     $candidates = @(
-        Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe",
-        Join-Path ${env:ProgramFiles} "Inno Setup 6\ISCC.exe"
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
     )
     $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
     if ($pf86) {
@@ -43,7 +43,6 @@ dotnet publish $project `
     -p:DebugType=None `
     -p:DebugSymbols=false `
     -p:PublishReadyToRun=true `
-    -p:SatelliteResourceLanguages=en`;de `
     -o $publishDir
 
 if ($LASTEXITCODE -ne 0) {

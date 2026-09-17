@@ -99,4 +99,5 @@ public sealed class CategoryScan
     public bool Present { get; init; }
     public long Bytes { get; init; }
     public int Files { get; init; }
+    public bool Deep { get; init; } = true;
 }

@@ -24,21 +24,37 @@ public static class FileSizeFormatter
 
 public static class SizeScanner
 {
-    public static CategoryScan Scan(CategoryDefinition category, CursorPaths paths)
+    public static CategoryScan Scan(CategoryDefinition category, CursorPaths paths, bool deep = true)
     {
+        var entries = category.Resolve(paths);
+        if (entries.Count == 0)
+            return Empty(category.Id);
+
+        if (!deep && category.IsLarge)
+        {
+            return new CategoryScan
+            {
+                Id = category.Id,
+                Present = entries.Any(Exists),
+                Bytes = 0,
+                Files = 0,
+                Deep = false
+            };
+        }
+
         long bytes = 0;
         var files = 0;
         var present = false;
 
-        foreach (var entry in category.Resolve(paths))
+        foreach (var entry in entries)
         {
-            foreach (var file in FileInventory.Enumerate(entry, sourceIsLocal: true))
-            {
-                present = true;
-                files++;
-                try { bytes += new FileInfo(file.SourcePath).Length; }
-                catch { }
-            }
+            var measured = FileInventory.Measure(entry);
+            if (!measured.Present)
+                continue;
+
+            present = true;
+            files += measured.Files;
+            bytes += measured.Bytes;
         }
 
         return new CategoryScan
@@ -49,4 +65,13 @@ public static class SizeScanner
             Files = files
         };
     }
+
+    private static CategoryScan Empty(string id) => new()
+    {
+        Id = id,
+        Present = false
+    };
+
+    private static bool Exists(SyncEntry entry) =>
+        entry.IsDirectory ? Directory.Exists(entry.LocalPath) : File.Exists(entry.LocalPath);
 }

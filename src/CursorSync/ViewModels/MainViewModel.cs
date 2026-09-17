@@ -70,9 +70,10 @@ public partial class MainViewModel : ObservableObject
 
         SelectedKind = SyncKind.TwoWay;
         InitializeFromSettings();
-        RefreshStatus();
-        RefreshHubInfo();
-        _ = RefreshSizesAsync();
+        StatusBarText = "Starting…";
+        IsBusy = true;
+        IsBusyIndeterminate = true;
+        _ = InitializeAsync();
     }
 
     public AppSettings Settings { get; }
@@ -113,8 +114,13 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty] private string? _confirmTitle;
     [ObservableProperty] private string? _confirmMessage;
     [ObservableProperty] private bool _isConfirmOpen;
+    [ObservableProperty] private bool _isBusy;
+    [ObservableProperty] private bool _isBusyIndeterminate = true;
+    [ObservableProperty] private string _statusBarText = "Starting…";
 
     private Action? _confirmAction;
+    private int _scanGeneration;
+    private bool _suspendCategoryPersist;
 
     partial void OnHubPathChanged(string? value)
     {
@@ -222,28 +228,44 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand]
     private void EnableRecommended()
     {
-        foreach (var item in Categories)
-            item.IsEnabled = item.IsRecommended;
+        SetEnabledBulk(item => item.IsRecommended);
     }
 
     [RelayCommand]
     private void EnableNone()
     {
-        foreach (var item in Categories)
-            item.IsEnabled = false;
+        SetEnabledBulk(_ => false);
     }
 
     [RelayCommand]
     private void EnableAll()
     {
-        foreach (var item in Categories)
-            item.IsEnabled = true;
+        SetEnabledBulk(_ => true);
+    }
+
+    private void SetEnabledBulk(Func<CategoryItemViewModel, bool> selector)
+    {
+        _suspendCategoryPersist = true;
+        try
+        {
+            foreach (var item in Categories)
+                item.IsEnabled = selector(item);
+        }
+        finally
+        {
+            _suspendCategoryPersist = false;
+        }
+
+        PersistCategorySelection();
     }
 
     [RelayCommand]
     private async Task RefreshAsync()
     {
-        RefreshStatus();
+        StatusBarText = "Refreshing…";
+        IsBusy = true;
+        IsBusyIndeterminate = true;
+        await RefreshStatusAsync();
         RefreshHubInfo();
         await RefreshSizesAsync();
     }
@@ -411,9 +433,12 @@ public partial class MainViewModel : ObservableObject
         }
 
         IsSyncing = true;
+        IsBusy = true;
+        IsBusyIndeterminate = true;
         IsProgressIndeterminate = true;
         ProgressValue = 0;
         ProgressText = "Preparing…";
+        StatusBarText = "Preparing sync…";
         ActivityLog.Clear();
         _syncCts = new CancellationTokenSource();
         CurrentPage = AppPage.Sync;
@@ -421,10 +446,18 @@ public partial class MainViewModel : ObservableObject
         var progress = new Progress<SyncProgress>(p =>
         {
             ProgressText = p.Message;
+            StatusBarText = p.Message;
+            IsBusy = true;
             if (p.Fraction is { } fraction)
             {
+                IsBusyIndeterminate = false;
                 IsProgressIndeterminate = false;
                 ProgressValue = Math.Clamp(fraction, 0, 1);
+            }
+            else
+            {
+                IsBusyIndeterminate = true;
+                IsProgressIndeterminate = true;
             }
             if (!string.IsNullOrWhiteSpace(p.Message))
                 AppendLog(p.Message);
@@ -451,6 +484,8 @@ public partial class MainViewModel : ObservableObject
         finally
         {
             IsSyncing = false;
+            if (!IsScanning)
+                IsBusy = false;
             _syncCts.Dispose();
             _syncCts = null;
         }
@@ -488,6 +523,7 @@ public partial class MainViewModel : ObservableObject
         {
             var summary = $"{result.FilesCopied} files · {FileSizeFormatter.FromBytes(result.BytesCopied)}";
             ShowBanner($"{SelectedKindLabel} complete — {summary}", "success");
+            StatusBarText = $"{SelectedKindLabel} complete — {summary}";
             StatusMessage = summary;
             if (result.Warnings.Count > 0)
                 AppendLog($"{result.Warnings.Count} warning(s).");
@@ -495,6 +531,7 @@ public partial class MainViewModel : ObservableObject
         else
         {
             ShowBanner(result.Error ?? "Sync failed.", "error");
+            StatusBarText = result.Error ?? "Sync failed.";
             StatusMessage = result.Error;
         }
     }
@@ -516,17 +553,52 @@ public partial class MainViewModel : ObservableObject
 
     private void PersistCategorySelection()
     {
+        if (_suspendCategoryPersist)
+            return;
         Settings.CategoryEnabled = Categories.ToDictionary(c => c.Id, c => c.IsEnabled, StringComparer.OrdinalIgnoreCase);
         SaveSettings();
         UpdateEnabledSummary();
+        UpdateEnabledTotal();
+        if (Categories.Any(c => c.IsEnabled && !c.WasMeasured))
+            _ = RefreshSizesAsync();
     }
 
     private void SaveSettings() => _store.Save(Settings);
 
+    private async Task InitializeAsync()
+    {
+        try
+        {
+            StatusBarText = "Checking Cursor…";
+            IsBusy = true;
+            IsBusyIndeterminate = true;
+            await RefreshStatusAsync();
+            RefreshHubInfo();
+            await RefreshSizesAsync();
+        }
+        catch (Exception ex)
+        {
+            StatusBarText = "Startup check failed.";
+            ShowBanner(ex.Message, "error");
+            IsBusy = false;
+        }
+    }
+
+    private async Task RefreshStatusAsync()
+    {
+        var paths = CursorPaths.FromSettings(Settings);
+        var status = await Task.Run(() => CursorProcessService.GetStatus(paths));
+        ApplyCursorStatus(status, paths);
+    }
+
     private void RefreshStatus()
     {
         var paths = CursorPaths.FromSettings(Settings);
-        var status = CursorProcessService.GetStatus(paths);
+        ApplyCursorStatus(CursorProcessService.GetStatus(paths), paths);
+    }
+
+    private void ApplyCursorStatus(CursorStatus status, CursorPaths paths)
+    {
         IsCursorRunning = status.IsRunning;
         CursorFound = status.UserFolderFound;
         CursorStatusText = status.IsRunning
@@ -588,28 +660,69 @@ public partial class MainViewModel : ObservableObject
             : string.Join(" · ", enabled.Select(c => c.Title));
     }
 
+    private void UpdateEnabledTotal()
+    {
+        var enabled = Categories.Where(c => c.IsEnabled).ToList();
+        var measured = enabled.Where(c => c.WasMeasured).ToList();
+        var pending = enabled.Count - measured.Count;
+        var total = measured.Sum(c => c.Bytes);
+        TotalSizeText = pending > 0 && measured.Count == 0
+            ? "…"
+            : pending > 0
+                ? FileSizeFormatter.FromBytes(total) + "+"
+                : FileSizeFormatter.FromBytes(total);
+    }
+
     private async Task RefreshSizesAsync()
     {
+        var generation = Interlocked.Increment(ref _scanGeneration);
         IsScanning = true;
+        IsBusy = true;
+        IsBusyIndeterminate = true;
+        StatusBarText = "Measuring local Cursor data…";
         var paths = CursorPaths.FromSettings(Settings);
+
         try
         {
-            var scans = await Task.Run(() =>
-                Categories.Select(item => SizeScanner.Scan(item.Definition, paths)).ToList());
+            var ordered = Categories
+                .OrderByDescending(c => c.IsEnabled)
+                .ThenBy(c => c.IsLarge)
+                .ToList();
 
-            long total = 0;
-            foreach (var scan in scans)
+            foreach (var item in ordered)
             {
-                var item = Categories.First(c => c.Id == scan.Id);
+                if (generation != _scanGeneration)
+                    return;
+
+                var deep = item.IsEnabled || !item.IsLarge;
+                StatusBarText = deep
+                    ? $"Measuring {item.Title}…"
+                    : $"Checking {item.Title}…";
+
+                var scan = await Task.Run(() => SizeScanner.Scan(item.Definition, paths, deep));
+                if (generation != _scanGeneration)
+                    return;
+
                 item.ApplyScan(scan);
-                if (item.IsEnabled)
-                    total += scan.Bytes;
+                UpdateEnabledTotal();
             }
-            TotalSizeText = FileSizeFormatter.FromBytes(total);
+
+            if (!IsSyncing)
+                StatusBarText = "Ready";
+        }
+        catch (Exception ex)
+        {
+            StatusBarText = "Could not measure local data.";
+            ShowBanner(ex.Message, "warn");
         }
         finally
         {
-            IsScanning = false;
+            if (generation == _scanGeneration)
+            {
+                IsScanning = false;
+                if (!IsSyncing)
+                    IsBusy = false;
+            }
         }
     }
 

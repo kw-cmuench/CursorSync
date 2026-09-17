@@ -29,12 +29,25 @@ public partial class CategoryItemViewModel : ObservableObject
     [ObservableProperty] private string _sizeText = "…";
     [ObservableProperty] private string _detailText = "Not scanned yet";
     [ObservableProperty] private bool _isPresent;
+    [ObservableProperty] private long _bytes;
+    [ObservableProperty] private bool _wasMeasured;
 
     partial void OnIsEnabledChanged(bool value) => _onChanged();
 
     public void ApplyScan(CategoryScan scan)
     {
         IsPresent = scan.Present;
+        Bytes = scan.Bytes;
+        WasMeasured = scan.Deep;
+        if (!scan.Deep)
+        {
+            SizeText = scan.Present ? "Large" : "Empty";
+            DetailText = scan.Present
+                ? "Present — measured when enabled or before sync"
+                : "Nothing on this machine yet";
+            return;
+        }
+
         SizeText = scan.Present ? FileSizeFormatter.FromBytes(scan.Bytes) : "Empty";
         DetailText = scan.Present
             ? $"{scan.Files} file{(scan.Files == 1 ? "" : "s")} · {FileSizeFormatter.FromBytes(scan.Bytes)}"

@@ -48,36 +48,95 @@ public static class FileInventory
             ? new HashSet<string>(entry.IncludeFileNames, StringComparer.OrdinalIgnoreCase)
             : null;
 
-        var stack = new Stack<string>();
-        stack.Push(root);
-
-        while (stack.Count > 0)
+        if (includeFiles is not null)
         {
-            var current = stack.Pop();
-            string[] dirs;
-            try { dirs = Directory.GetDirectories(current); }
-            catch { dirs = []; }
-
-            foreach (var dir in dirs)
-            {
-                if (!excludeDirs.Contains(Path.GetFileName(dir)))
-                    stack.Push(dir);
-            }
-
             string[] files;
-            try { files = Directory.GetFiles(current); }
-            catch { files = []; }
+            try { files = Directory.GetFiles(root); }
+            catch { yield break; }
 
             foreach (var file in files)
             {
                 var name = Path.GetFileName(file);
-                if (excludeFiles.Contains(name))
-                    continue;
-                if (includeFiles is not null && !includeFiles.Contains(name))
-                    continue;
-                yield return file;
+                if (!excludeFiles.Contains(name) && includeFiles.Contains(name))
+                    yield return file;
             }
+
+            yield break;
         }
+
+        var options = new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = true,
+            ReturnSpecialDirectories = false,
+            AttributesToSkip = FileAttributes.ReparsePoint | FileAttributes.System
+        };
+
+        IEnumerable<string> filesWalk;
+        try { filesWalk = Directory.EnumerateFiles(root, "*", options); }
+        catch { yield break; }
+
+        foreach (var file in filesWalk)
+        {
+            if (excludeDirs.Count > 0 && IsUnderExcludedDirectory(root, file, excludeDirs))
+                continue;
+
+            var name = Path.GetFileName(file);
+            if (excludeFiles.Contains(name))
+                continue;
+
+            yield return file;
+        }
+    }
+
+    public static (bool Present, int Files, long Bytes) Measure(SyncEntry entry)
+    {
+        if (entry.IsDirectory)
+        {
+            if (!Directory.Exists(entry.LocalPath))
+                return default;
+
+            var files = 0;
+            long bytes = 0;
+            foreach (var file in EnumerateDirectory(entry.LocalPath, entry))
+            {
+                files++;
+                try { bytes += new FileInfo(file).Length; }
+                catch { }
+            }
+
+            return (files > 0 || Directory.Exists(entry.LocalPath), files, bytes);
+        }
+
+        var present = false;
+        var count = 0;
+        long size = 0;
+        foreach (var suffix in PrimaryAndSuffixes(entry.CompanionSuffixes))
+        {
+            var path = entry.LocalPath + suffix;
+            if (!File.Exists(path))
+                continue;
+
+            present = true;
+            count++;
+            try { size += new FileInfo(path).Length; }
+            catch { }
+        }
+
+        return (present, count, size);
+    }
+
+    private static bool IsUnderExcludedDirectory(string root, string filePath, HashSet<string> excludeDirs)
+    {
+        var relative = Path.GetRelativePath(root, filePath);
+        var parts = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        for (var i = 0; i < parts.Length - 1; i++)
+        {
+            if (excludeDirs.Contains(parts[i]))
+                return true;
+        }
+
+        return false;
     }
 
     public static string HubPath(string? hubRoot, string relative)
