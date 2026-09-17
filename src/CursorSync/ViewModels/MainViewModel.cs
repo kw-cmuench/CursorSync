@@ -69,6 +69,7 @@ public partial class MainViewModel : ObservableObject
         ];
 
         SelectedKind = SyncKind.TwoWay;
+        Agents = new AgentTransferViewModel(this, _store);
         InitializeFromSettings();
         StatusBarText = "Starting…";
         IsBusy = true;
@@ -77,6 +78,7 @@ public partial class MainViewModel : ObservableObject
     }
 
     public AppSettings Settings { get; }
+    public AgentTransferViewModel Agents { get; }
     public ObservableCollection<CategoryItemViewModel> Categories { get; } = [];
     public IReadOnlyList<CategoryGroupViewModel> CategoryGroups { get; }
     public ObservableCollection<SyncHistoryEntry> History { get; } = [];
@@ -121,6 +123,42 @@ public partial class MainViewModel : ObservableObject
     private Action? _confirmAction;
     private int _scanGeneration;
     private bool _suspendCategoryPersist;
+    private int _workDepth;
+
+    partial void OnCurrentPageChanged(AppPage value)
+    {
+        if (value == AppPage.Agents)
+            _ = Agents.RefreshCommand.ExecuteAsync(null);
+    }
+
+    public void Notify(string text, string kind) => ShowBanner(text, kind);
+
+    public void Confirm(string title, string message, Action action) => AskConfirm(title, message, action);
+
+    public void RefreshCursorStatus() => RefreshStatus();
+
+    public void BeginBackgroundWork(string status)
+    {
+        _workDepth++;
+        IsBusy = true;
+        IsBusyIndeterminate = true;
+        StatusBarText = status;
+    }
+
+    public void EndBackgroundWork()
+    {
+        _workDepth = Math.Max(0, _workDepth - 1);
+        if (_workDepth > 0 || IsSyncing || IsScanning)
+            return;
+        IsBusy = false;
+        StatusBarText = "Ready";
+    }
+
+    public void AddHistory(SyncHistoryEntry entry)
+    {
+        History.Insert(0, entry);
+        _store.SaveHistory(History.ToList());
+    }
 
     partial void OnHubPathChanged(string? value)
     {

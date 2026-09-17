@@ -20,6 +20,7 @@ public sealed class SettingsStore
     public string SettingsPath { get; }
     public string HistoryPath { get; }
     public string BackupsFolder { get; }
+    public string AgentBackupsFolder { get; }
     public string AppDataFolder { get; }
 
     public SettingsStore()
@@ -27,7 +28,9 @@ public sealed class SettingsStore
         AppDataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CursorSync");
         SettingsPath = Path.Combine(AppDataFolder, "settings.json");
         HistoryPath = Path.Combine(AppDataFolder, "history.json");
-        BackupsFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CursorSync", "Backups");
+        var local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CursorSync");
+        BackupsFolder = Path.Combine(local, "Backups");
+        AgentBackupsFolder = Path.Combine(local, "AgentBackups");
     }
 
     public AppSettings Load()

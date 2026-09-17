@@ -4,6 +4,7 @@ public enum AppPage
 {
     Dashboard,
     Categories,
+    Agents,
     Sync,
     History,
     Settings

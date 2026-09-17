@@ -13,6 +13,7 @@
             <converters:BoolToVisibilityConverter x:Key="BoolToVis"/>
             <converters:BoolToVisibilityConverter x:Key="InverseBoolToVis" Invert="True"/>
             <converters:NullOrEmptyToVisibilityConverter x:Key="NullToVis"/>
+            <converters:ZeroToVisibilityConverter x:Key="ZeroToVis"/>
             <converters:PageEqualsConverter x:Key="PageEquals"/>
             <converters:EnumEqualsConverter x:Key="EnumEquals"/>
         </ResourceDictionary>
