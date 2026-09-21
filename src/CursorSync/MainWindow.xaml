@@ -25,6 +25,7 @@
         <Grid.RowDefinitions>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <Grid>
@@ -78,6 +79,22 @@
                         </StackPanel>
                     </RadioButton>
                     <RadioButton Style="{StaticResource NavItem}" GroupName="Nav"
+                                 IsChecked="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Workspaces}"
+                                 Command="{Binding NavigateCommand}" CommandParameter="Workspaces">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE8F1;" FontFamily="{StaticResource IconFont}" Width="22"/>
+                            <TextBlock Text="Workspaces" Margin="8,0,0,0"/>
+                        </StackPanel>
+                    </RadioButton>
+                    <RadioButton Style="{StaticResource NavItem}" GroupName="Nav"
+                                 IsChecked="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Projects}"
+                                 Command="{Binding NavigateCommand}" CommandParameter="Projects">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE8F0;" FontFamily="{StaticResource IconFont}" Width="22"/>
+                            <TextBlock Text="Projects" Margin="8,0,0,0"/>
+                        </StackPanel>
+                    </RadioButton>
+                    <RadioButton Style="{StaticResource NavItem}" GroupName="Nav"
                                  IsChecked="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Agents}"
                                  Command="{Binding NavigateCommand}" CommandParameter="Agents">
                         <StackPanel Orientation="Horizontal">
@@ -125,7 +142,6 @@
         <Grid Grid.Column="1">
             <Grid.RowDefinitions>
                 <RowDefinition Height="48"/>
-                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
 
@@ -152,30 +168,11 @@
                 </Grid>
             </Border>
 
-            <Border Grid.Row="1" Margin="28,0,28,0" CornerRadius="10" Padding="12,10"
-                    Visibility="{Binding BannerText, Converter={StaticResource NullToVis}}">
-                <Border.Style>
-                    <Style TargetType="Border">
-                        <Setter Property="Background" Value="{StaticResource AccentSoftBrush}"/>
-                        <Style.Triggers>
-                            <DataTrigger Binding="{Binding BannerKind}" Value="success">
-                                <Setter Property="Background" Value="{StaticResource SuccessSoftBrush}"/>
-                            </DataTrigger>
-                            <DataTrigger Binding="{Binding BannerKind}" Value="warn">
-                                <Setter Property="Background" Value="{StaticResource WarnSoftBrush}"/>
-                            </DataTrigger>
-                            <DataTrigger Binding="{Binding BannerKind}" Value="error">
-                                <Setter Property="Background" Value="{StaticResource DangerSoftBrush}"/>
-                            </DataTrigger>
-                        </Style.Triggers>
-                    </Style>
-                </Border.Style>
-                <TextBlock Text="{Binding BannerText}" TextWrapping="Wrap"/>
-            </Border>
-
-            <Grid Grid.Row="2" Margin="28,18,16,8">
+            <Grid Grid.Row="1" Margin="28,18,16,8">
                 <views:DashboardPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Dashboard}"/>
                 <views:CategoriesPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Categories}"/>
+                <views:WorkspacesPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Workspaces}"/>
+                <views:ProjectsPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Projects}"/>
                 <views:AgentsPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Agents}"/>
                 <views:SyncPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=Sync}"/>
                 <views:HistoryPage Visibility="{Binding CurrentPage, Converter={StaticResource PageEquals}, ConverterParameter=History}"/>
@@ -186,6 +183,30 @@
         </Grid>
 
         <Border Grid.Row="1"
+                Padding="16,8"
+                Visibility="{Binding BannerText, Converter={StaticResource NullToVis}}">
+            <Border.Style>
+                <Style TargetType="Border">
+                    <Setter Property="Background" Value="{StaticResource AccentSoftBrush}"/>
+                    <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
+                    <Setter Property="BorderThickness" Value="0,1,0,0"/>
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding BannerKind}" Value="success">
+                            <Setter Property="Background" Value="{StaticResource SuccessSoftBrush}"/>
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding BannerKind}" Value="warn">
+                            <Setter Property="Background" Value="{StaticResource WarnSoftBrush}"/>
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding BannerKind}" Value="error">
+                            <Setter Property="Background" Value="{StaticResource DangerSoftBrush}"/>
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </Border.Style>
+            <TextBlock Text="{Binding BannerText}" TextWrapping="Wrap" VerticalAlignment="Center"/>
+        </Border>
+
+        <Border Grid.Row="2"
                 Background="{StaticResource SidebarBrush}"
                 BorderBrush="{StaticResource BorderBrush}"
                 BorderThickness="0,1,0,0"
@@ -209,15 +230,20 @@
             </Grid>
         </Border>
 
-        <Border Grid.RowSpan="2" Background="#99000000"
+        <Border Grid.RowSpan="3" Background="#99000000"
                 Visibility="{Binding IsConfirmOpen, Converter={StaticResource BoolToVis}}">
-            <Border Style="{StaticResource Card}" Width="440" Padding="22" HorizontalAlignment="Center" VerticalAlignment="Center">
+            <Border Style="{StaticResource Card}" Width="480" Padding="22" HorizontalAlignment="Center" VerticalAlignment="Center">
                 <StackPanel>
-                    <TextBlock Text="{Binding ConfirmTitle}" FontSize="18" FontWeight="SemiBold"/>
+                    <TextBlock Text="{Binding ConfirmTitle}" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/>
                     <TextBlock Text="{Binding ConfirmMessage}" Style="{StaticResource MutedText}" Margin="0,10,0,18"/>
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                         <Button Content="Cancel" Style="{StaticResource GhostButton}" Command="{Binding CancelConfirmCommand}"/>
-                        <Button Content="Continue" Style="{StaticResource DangerButton}" Margin="8,0,0,0" Command="{Binding ConfirmCommand}"/>
+                        <Button Content="{Binding ConfirmContinueText}" Style="{StaticResource DangerButton}" Margin="8,0,0,0"
+                                Command="{Binding ConfirmCommand}"
+                                Visibility="{Binding ConfirmIsDestructive, Converter={StaticResource BoolToVis}}"/>
+                        <Button Content="{Binding ConfirmContinueText}" Style="{StaticResource PrimaryButton}" Margin="8,0,0,0"
+                                Command="{Binding ConfirmCommand}"
+                                Visibility="{Binding ConfirmIsDestructive, Converter={StaticResource InverseBoolToVis}}"/>
                     </StackPanel>
                 </StackPanel>
             </Border>

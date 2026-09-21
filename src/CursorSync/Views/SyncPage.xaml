@@ -8,9 +8,9 @@
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
-        <StackPanel Margin="0,0,12,16">
+        <StackPanel Style="{StaticResource PageHeader}">
             <TextBlock Text="Sync" Style="{StaticResource TitleText}"/>
-            <TextBlock Margin="0,6,0,0" Style="{StaticResource MutedText}"
+            <TextBlock Style="{StaticResource PageLead}"
                        Text="Push copies this PC into the shared folder. Pull brings shared data here. Two-way keeps the newer file."/>
         </StackPanel>
 

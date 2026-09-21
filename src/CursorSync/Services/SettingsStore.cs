@@ -21,6 +21,7 @@ public sealed class SettingsStore
     public string HistoryPath { get; }
     public string BackupsFolder { get; }
     public string AgentBackupsFolder { get; }
+    public string SafetyFolder { get; }
     public string AppDataFolder { get; }
 
     public SettingsStore()
@@ -31,6 +32,7 @@ public sealed class SettingsStore
         var local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CursorSync");
         BackupsFolder = Path.Combine(local, "Backups");
         AgentBackupsFolder = Path.Combine(local, "AgentBackups");
+        SafetyFolder = Path.Combine(local, "Safety");
     }
 
     public AppSettings Load()

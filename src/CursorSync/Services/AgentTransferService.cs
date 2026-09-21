@@ -107,6 +107,193 @@ public sealed class AgentTransferService
         };
     }
 
+    public AgentTransferResult BackupPack(
+        IReadOnlyList<AgentRecord> agents,
+        CursorPaths paths,
+        string destination,
+        bool includeTranscript,
+        bool includeStore,
+        bool includeWaypoints,
+        IProgress<SyncProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        if (agents.Count == 0)
+            return Fail("Select at least one workspace or agent.");
+
+        Directory.CreateDirectory(destination);
+        var warnings = new List<string>();
+        var log = new List<string>();
+        var files = 0;
+        long bytes = 0;
+
+        foreach (var agent in agents)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            progress.Report(new SyncProgress { Message = $"Backing up {agent.Title}…" });
+            var agentDir = Path.Combine(destination, "agents", agent.ComposerId);
+            var result = Backup(agent, paths, agentDir, includeTranscript, includeStore, includeWaypoints, progress, cancellationToken);
+            files += result.FilesCopied;
+            bytes += result.BytesCopied;
+            log.AddRange(result.Log.Select(line => $"{agent.Title}: {line}"));
+            warnings.AddRange(result.Warnings);
+            if (!result.Success && !string.IsNullOrWhiteSpace(result.Error))
+                warnings.Add($"{agent.Title}: {result.Error}");
+        }
+
+        var workspaces = agents
+            .GroupBy(a => a.WorkspaceId ?? a.WorkspacePath ?? a.WorkspaceLabel ?? "unknown")
+            .Select(g => new WorkspaceBackupRef
+            {
+                Id = g.First().WorkspaceId ?? "",
+                Label = g.First().WorkspaceLabel ?? "Unknown workspace",
+                FolderPath = g.First().WorkspacePath ?? ""
+            })
+            .ToList();
+
+        var title = workspaces.Count == 1
+            ? $"{workspaces[0].Label} · {agents.Count} agent{(agents.Count == 1 ? "" : "s")}"
+            : $"{workspaces.Count} workspaces · {agents.Count} agents";
+
+        var pack = new AgentBackupManifest
+        {
+            SchemaVersion = 2,
+            Kind = "workspacePack",
+            Title = title,
+            CreatedUtc = DateTime.UtcNow,
+            IncludeTranscript = includeTranscript,
+            IncludeStore = includeStore,
+            IncludeWaypoints = includeWaypoints,
+            Files = files,
+            Bytes = bytes,
+            AgentCount = agents.Count,
+            Workspaces = workspaces
+        };
+        File.WriteAllText(Path.Combine(destination, "manifest.json"), JsonSerializer.Serialize(pack, JsonUtil.Options));
+        log.Add($"Pack contains {agents.Count} agent(s) from {workspaces.Count} workspace(s).");
+
+        return new AgentTransferResult
+        {
+            Success = true,
+            OutputPath = destination,
+            FilesCopied = files,
+            BytesCopied = bytes,
+            Warnings = warnings,
+            Log = log
+        };
+    }
+
+    public AgentTransferResult RestorePack(
+        string backupFolder,
+        IReadOnlyList<CursorWorkspaceInfo> localWorkspaces,
+        CursorWorkspaceInfo? fallbackTarget,
+        CursorPaths paths,
+        bool includeTranscript,
+        bool includeStore,
+        bool includeWaypoints,
+        bool forceTarget,
+        IProgress<SyncProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        var agentsRoot = Path.Combine(backupFolder, "agents");
+        if (!Directory.Exists(agentsRoot))
+        {
+            if (File.Exists(Path.Combine(backupFolder, "manifest.json")))
+            {
+                var target = fallbackTarget ?? throw new InvalidOperationException("Choose a workspace to restore into.");
+                return Restore(backupFolder, target, paths, includeTranscript, includeStore, includeWaypoints, progress, cancellationToken);
+            }
+            return Fail("This folder is not a CursorSync agent backup.");
+        }
+
+        var warnings = new List<string>();
+        var log = new List<string>();
+        var files = 0;
+        long bytes = 0;
+        var restored = 0;
+
+        foreach (var dir in Directory.EnumerateDirectories(agentsRoot))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var agentManifestPath = Path.Combine(dir, "manifest.json");
+            AgentBackupManifest? agentManifest = null;
+            if (File.Exists(agentManifestPath))
+            {
+                try
+                {
+                    agentManifest = JsonSerializer.Deserialize<AgentBackupManifest>(File.ReadAllText(agentManifestPath), JsonUtil.Options);
+                }
+                catch
+                {
+                    // fall through
+                }
+            }
+
+            var target = forceTarget && fallbackTarget is not null
+                ? fallbackTarget
+                : ResolveTarget(agentManifest, localWorkspaces, fallbackTarget);
+            if (target is null)
+            {
+                warnings.Add($"{agentManifest?.Title ?? Path.GetFileName(dir)}: no matching workspace on this PC. Choose a restore target.");
+                continue;
+            }
+
+            progress.Report(new SyncProgress { Message = $"Restoring {agentManifest?.Title ?? Path.GetFileName(dir)} → {target.Label}…" });
+            var result = Restore(dir, target, paths, includeTranscript, includeStore, includeWaypoints, progress, cancellationToken);
+            files += result.FilesCopied;
+            bytes += result.BytesCopied;
+            log.AddRange(result.Log);
+            warnings.AddRange(result.Warnings);
+            if (result.Success)
+                restored++;
+            else if (!string.IsNullOrWhiteSpace(result.Error))
+                warnings.Add(result.Error);
+        }
+
+        if (restored == 0)
+            return Fail(warnings.Count > 0 ? warnings[0] : "Nothing could be restored.");
+
+        return new AgentTransferResult
+        {
+            Success = true,
+            OutputPath = fallbackTarget?.FolderPath,
+            FilesCopied = files,
+            BytesCopied = bytes,
+            Warnings = warnings,
+            Log = log
+        };
+    }
+
+    private static CursorWorkspaceInfo? ResolveTarget(
+        AgentBackupManifest? manifest,
+        IReadOnlyList<CursorWorkspaceInfo> localWorkspaces,
+        CursorWorkspaceInfo? fallback)
+    {
+        if (!string.IsNullOrWhiteSpace(manifest?.SourceWorkspacePath))
+        {
+            var match = CursorWorkspaceLocator.FindByFolder(localWorkspaces, manifest.SourceWorkspacePath);
+            if (match is not null)
+                return match;
+        }
+
+        if (!string.IsNullOrWhiteSpace(manifest?.SourceWorkspaceId))
+        {
+            var match = localWorkspaces.FirstOrDefault(w =>
+                string.Equals(w.Id, manifest.SourceWorkspaceId, StringComparison.OrdinalIgnoreCase));
+            if (match is not null)
+                return match;
+        }
+
+        if (!string.IsNullOrWhiteSpace(manifest?.SourceProjectSlug))
+        {
+            var match = localWorkspaces.FirstOrDefault(w =>
+                string.Equals(w.Slug, manifest.SourceProjectSlug, StringComparison.OrdinalIgnoreCase));
+            if (match is not null)
+                return match;
+        }
+
+        return fallback;
+    }
+
     public AgentTransferResult Restore(
         string backupFolder,
         CursorWorkspaceInfo target,
@@ -234,8 +421,242 @@ public sealed class AgentTransferService
         };
     }
 
+    public AgentTransferResult Assign(
+        IReadOnlyList<AgentRecord> agents,
+        CursorWorkspaceInfo target,
+        CursorPaths paths,
+        IProgress<SyncProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        if (agents.Count == 0)
+            return Fail("Select at least one agent to assign.");
+        if (string.IsNullOrWhiteSpace(target.Id) || string.IsNullOrWhiteSpace(target.StorageDir))
+            return Fail("Choose a workspace Cursor already knows.");
+
+        CursorWorkspaceLocator.EnsureProjectTranscripts(paths, target.FolderPath);
+
+        var warnings = new List<string>();
+        var log = new List<string>();
+        var files = 0;
+        long bytes = 0;
+        var moved = 0;
+
+        if (!target.IsReady)
+            warnings.Add($"“{target.Label}” has no workspace database yet. Open that folder in Cursor once so it appears in the sidebar.");
+
+        foreach (var agent in agents)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            progress.Report(new SyncProgress { Message = $"Assigning {agent.Title} → {target.Label}…" });
+
+            try
+            {
+                var fromFolder = agent.WorkspacePath;
+                var destTranscript = Path.Combine(paths.Projects, target.Slug, "agent-transcripts", agent.ComposerId);
+                var sourceTranscript = ResolveExistingDir(
+                    agent.TranscriptDir,
+                    destTranscript,
+                    string.IsNullOrWhiteSpace(agent.ProjectSlug)
+                        ? null
+                        : Path.Combine(paths.Projects, agent.ProjectSlug, "agent-transcripts", agent.ComposerId));
+
+                if (!string.IsNullOrWhiteSpace(sourceTranscript))
+                {
+                    if (!CursorWorkspaceLocator.SameFolder(sourceTranscript, destTranscript))
+                    {
+                        if (Directory.Exists(destTranscript))
+                        {
+                            warnings.Add($"{agent.Title}: a transcript already exists in {target.Label}. Left the files in place and still retargeted the chat.");
+                        }
+                        else
+                        {
+                            MoveTree(sourceTranscript, destTranscript, ref files, ref bytes, cancellationToken);
+                        }
+                    }
+
+                    var rewriteRoot = Directory.Exists(destTranscript) ? destTranscript : sourceTranscript;
+                    RewriteTree(rewriteRoot, agent.ComposerId, agent.ComposerId, fromFolder, target.FolderPath);
+                    log.Add($"{agent.Title}: transcript linked to {target.Label}.");
+                }
+
+                if (Directory.Exists(agent.StoreDir))
+                {
+                    RewriteTree(agent.StoreDir, agent.ComposerId, agent.ComposerId, fromFolder, target.FolderPath);
+                    log.Add($"{agent.Title}: memory store paths updated.");
+                }
+
+                foreach (var extra in agent.SubagentStoreDirs)
+                {
+                    if (Directory.Exists(extra))
+                        RewriteTree(extra, agent.ComposerId, agent.ComposerId, fromFolder, target.FolderPath);
+                }
+
+                foreach (var dir in agent.WaypointDirs)
+                {
+                    if (!Directory.Exists(dir))
+                        continue;
+                    RewriteTree(dir, agent.ComposerId, agent.ComposerId, fromFolder, target.FolderPath);
+                    RewriteWaypointMetadata(dir, target);
+                }
+
+                var header = RemapText(agent.HeaderJson, agent.ComposerId, agent.ComposerId, fromFolder, target.FolderPath);
+                SqliteStateStore.RetargetComposer(paths, agent, target, header, cancellationToken);
+                moved++;
+                log.Add($"{agent.Title}: chat list now points at {target.Label}.");
+            }
+            catch (Exception ex)
+            {
+                warnings.Add($"{agent.Title}: {UserFacingError.From(ex)}");
+            }
+        }
+
+        if (moved == 0)
+            return Fail(warnings.Count > 0 ? warnings[0] : "Nothing could be assigned.");
+
+        return new AgentTransferResult
+        {
+            Success = true,
+            OutputPath = target.FolderPath,
+            FilesCopied = files,
+            BytesCopied = bytes,
+            Warnings = warnings,
+            Log = log
+        };
+    }
+
+    public AgentTransferResult Delete(
+        IReadOnlyList<AgentRecord> agents,
+        CursorPaths paths,
+        IProgress<SyncProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        var selected = agents
+            .Where(agent => AgentCatalog.IsComposerId(agent.ComposerId))
+            .GroupBy(agent => agent.ComposerId, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+        if (selected.Count == 0)
+            return Fail("Check one or more chats to delete.");
+
+        var warnings = new List<string>();
+        var log = new List<string>();
+        var files = 0;
+        long bytes = 0;
+        var removed = 0;
+
+        try
+        {
+            progress.Report(new SyncProgress { Message = "Updating the chat list…" });
+            SqliteStateStore.DeleteComposers(paths, selected, cancellationToken);
+            log.Add($"Removed {selected.Count} chat{(selected.Count == 1 ? "" : "s")} from Cursor’s sidebar database.");
+        }
+        catch (Exception ex)
+        {
+            return Fail("The chats could not be removed from Cursor’s database: " + UserFacingError.From(ex));
+        }
+
+        foreach (var agent in selected)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            progress.Report(new SyncProgress { Message = $"Deleting {agent.Title}…" });
+            TryDeleteUnder(paths.Projects, agent.TranscriptDir, "transcript", agent.Title, warnings, log, ref files, ref bytes);
+            TryDeleteUnder(paths.AgentStores, agent.StoreDir, "memory store", agent.Title, warnings, log, ref files, ref bytes);
+            foreach (var extra in agent.SubagentStoreDirs)
+                TryDeleteUnder(paths.AgentStores, extra, "subagent store", agent.Title, warnings, log, ref files, ref bytes);
+            foreach (var waypoint in agent.WaypointDirs)
+                TryDeleteUnder(paths.Checkpoints, waypoint, "checkpoint", agent.Title, warnings, log, ref files, ref bytes);
+
+            removed++;
+        }
+
+        if (removed == 0)
+            return Fail(warnings.Count > 0 ? warnings[0] : "Nothing could be deleted.");
+
+        return new AgentTransferResult
+        {
+            Success = true,
+            FilesCopied = removed,
+            BytesCopied = bytes,
+            Warnings = warnings,
+            Log = log
+        };
+    }
+
+    private static bool TryDeleteUnder(
+        string root,
+        string? path,
+        string kind,
+        string title,
+        List<string> warnings,
+        List<string> log,
+        ref int files,
+        ref long bytes)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+            return false;
+
+        try
+        {
+            var prefix = Path.GetFullPath(root).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+            var full = Path.GetFullPath(path).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+            if (full.Length <= prefix.Length || !full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                warnings.Add($"{title}: refused to delete {kind} outside Cursor’s data folders.");
+                return false;
+            }
+
+            foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+            {
+                files++;
+                try { bytes += new FileInfo(file).Length; }
+                catch { }
+            }
+
+            Directory.Delete(path, recursive: true);
+            log.Add($"{title}: deleted {kind}.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            warnings.Add($"{title}: {kind} could not be deleted. {UserFacingError.From(ex)}");
+            return false;
+        }
+    }
+
     private static AgentTransferResult Fail(string error) =>
         new() { Success = false, Error = error };
+
+    private static string? ResolveExistingDir(params string?[] candidates) =>
+        candidates.FirstOrDefault(dir => !string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir));
+
+    private static void MoveTree(
+        string source,
+        string destination,
+        ref int files,
+        ref long bytes,
+        CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        try
+        {
+            Directory.Move(source, destination);
+            foreach (var file in Directory.EnumerateFiles(destination, "*", SearchOption.AllDirectories))
+            {
+                files++;
+                try { bytes += new FileInfo(file).Length; }
+                catch { }
+            }
+            return;
+        }
+        catch
+        {
+            // copy then delete if a move across volumes fails
+        }
+
+        CopyTree(source, destination, null, null, ref files, ref bytes, cancellationToken);
+        try { Directory.Delete(source, recursive: true); }
+        catch { }
+    }
 
     private static void CopyTree(
         string source,
@@ -370,6 +791,7 @@ public sealed class AgentTransferService
         var to = CursorWorkspaceLocator.NormalizeFolder(toFolder);
         updated = ReplaceInsensitivePlain(updated, from, to);
         updated = ReplaceInsensitivePlain(updated, from.Replace('\\', '/'), to.Replace('\\', '/'));
+        updated = ReplaceInsensitivePlain(updated, CursorWorkspaceLocator.ToFileUri(from), CursorWorkspaceLocator.ToFileUri(to));
         updated = ReplaceInsensitivePlain(updated, Uri.EscapeDataString(from.Replace('\\', '/')), Uri.EscapeDataString(to.Replace('\\', '/')));
         updated = ReplaceInsensitivePlain(updated, CursorWorkspaceLocator.ToProjectSlug(from), CursorWorkspaceLocator.ToProjectSlug(to));
         return updated;

@@ -1,6 +1,7 @@
 ﻿using System.IO;
 using System.Windows;
 using System.Windows.Threading;
+using CursorSync.Services;
 
 namespace CursorSync;
 
@@ -16,7 +17,11 @@ public partial class App : Application
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
         Log(e.Exception);
-        MessageBox.Show(e.Exception.Message, "CursorSync", MessageBoxButton.OK, MessageBoxImage.Error);
+        MessageBox.Show(
+            UserFacingError.From(e.Exception),
+            "CursorSync",
+            MessageBoxButton.OK,
+            MessageBoxImage.Error);
         e.Handled = true;
     }
 

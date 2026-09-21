@@ -89,29 +89,40 @@ public sealed class BackupService
 
     public string? Backup(CursorPaths paths, IReadOnlyList<CategoryDefinition> categories, CancellationToken cancellationToken)
     {
-        var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-        var folder = Path.Combine(_store.BackupsFolder, stamp);
-        Directory.CreateDirectory(folder);
+        var staging = Path.Combine(Path.GetTempPath(), "CursorSync", "pre-pull-" + Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(staging);
 
-        var copied = 0;
-        foreach (var category in categories)
+        try
         {
-            foreach (var entry in category.Resolve(paths))
+            var copied = 0;
+            foreach (var category in categories)
             {
-                foreach (var pair in FileInventory.Enumerate(entry, sourceIsLocal: true, folder))
+                foreach (var entry in category.Resolve(paths))
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var destDir = Path.GetDirectoryName(pair.DestinationPath);
-                    if (!string.IsNullOrEmpty(destDir))
-                        Directory.CreateDirectory(destDir);
-                    File.Copy(pair.SourcePath, pair.DestinationPath, overwrite: true);
-                    copied++;
+                    foreach (var pair in FileInventory.Enumerate(entry, sourceIsLocal: true, staging))
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var destDir = Path.GetDirectoryName(pair.DestinationPath);
+                        if (!string.IsNullOrEmpty(destDir))
+                            Directory.CreateDirectory(destDir);
+                        File.Copy(pair.SourcePath, pair.DestinationPath, overwrite: true);
+                        copied++;
+                    }
                 }
             }
-        }
 
-        TrimOldBackups();
-        return copied == 0 ? null : folder;
+            if (copied == 0)
+                return null;
+
+            var zipPath = BackupArchive.UniquePath(_store.BackupsFolder, BackupArchive.FileName());
+            BackupArchive.CompressDirectory(staging, zipPath);
+            TrimOldBackups();
+            return zipPath;
+        }
+        finally
+        {
+            BackupArchive.TryDeleteDirectory(staging);
+        }
     }
 
     public void TrimOldBackups(int keep = 10)
@@ -119,13 +130,20 @@ public sealed class BackupService
         if (!Directory.Exists(_store.BackupsFolder))
             return;
 
-        var dirs = Directory.GetDirectories(_store.BackupsFolder)
-            .OrderByDescending(d => d)
+        var items = Directory.EnumerateFileSystemEntries(_store.BackupsFolder)
+            .Select(path => (Path: path, Write: File.GetLastWriteTimeUtc(path), IsDir: Directory.Exists(path)))
+            .OrderByDescending(item => item.Write)
             .Skip(keep);
 
-        foreach (var dir in dirs)
+        foreach (var item in items)
         {
-            try { Directory.Delete(dir, recursive: true); }
+            try
+            {
+                if (item.IsDir)
+                    Directory.Delete(item.Path, recursive: true);
+                else
+                    File.Delete(item.Path);
+            }
             catch { }
         }
     }

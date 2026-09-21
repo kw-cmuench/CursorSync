@@ -97,38 +97,124 @@ public static class AgentCatalog
         var list = new List<AgentBackupInfo>();
         foreach (var root in roots.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase))
         {
+            foreach (var zip in Directory.EnumerateFiles(root, "*.zip"))
+            {
+                var info = TryReadZipBackup(zip);
+                if (info is not null)
+                    list.Add(info);
+            }
+
             foreach (var dir in Directory.EnumerateDirectories(root))
             {
-                var manifestPath = Path.Combine(dir, "manifest.json");
-                if (!File.Exists(manifestPath))
-                    continue;
-
-                try
-                {
-                    var manifest = JsonSerializer.Deserialize<AgentBackupManifest>(File.ReadAllText(manifestPath), JsonUtil.Options);
-                    if (manifest is null || string.IsNullOrWhiteSpace(manifest.ComposerId))
-                        continue;
-
-                    var workspace = string.IsNullOrWhiteSpace(manifest.SourceWorkspacePath)
-                        ? "Unknown workspace"
-                        : Path.GetFileName(manifest.SourceWorkspacePath.TrimEnd('\\', '/'));
-                    list.Add(new AgentBackupInfo
-                    {
-                        FolderPath = dir,
-                        Manifest = manifest,
-                        Detail = $"{manifest.CreatedUtc.ToLocalTime():g} · {FileSizeFormatter.FromBytes(manifest.Bytes)} · {workspace}"
-                    });
-                }
-                catch
-                {
-                    // skip unreadable packages
-                }
+                var info = TryReadFolderBackup(dir);
+                if (info is not null)
+                    list.Add(info);
             }
         }
 
         return list
             .OrderByDescending(b => b.Manifest.CreatedUtc)
             .ToList();
+    }
+
+    private static AgentBackupInfo? TryReadFolderBackup(string dir)
+    {
+        var manifestPath = Path.Combine(dir, "manifest.json");
+        if (!File.Exists(manifestPath))
+            return null;
+
+        try
+        {
+            var manifest = JsonSerializer.Deserialize<AgentBackupManifest>(File.ReadAllText(manifestPath), JsonUtil.Options);
+            if (manifest is null)
+                return null;
+
+            var isPack = string.Equals(manifest.Kind, "workspacePack", StringComparison.OrdinalIgnoreCase)
+                         || Directory.Exists(Path.Combine(dir, "agents"));
+            var agentCount = Directory.Exists(Path.Combine(dir, "agents"))
+                ? Directory.GetDirectories(Path.Combine(dir, "agents")).Length
+                : 0;
+            return ToBackupInfo(dir, manifest, isPack, agentCount, manifest.Bytes);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static AgentBackupInfo? TryReadZipBackup(string zipPath)
+    {
+        try
+        {
+            using var zip = System.IO.Compression.ZipFile.OpenRead(zipPath);
+            var entry = zip.GetEntry("manifest.json");
+            if (entry is null)
+                return null;
+
+            using var stream = entry.Open();
+            using var reader = new StreamReader(stream);
+            var manifest = JsonSerializer.Deserialize<AgentBackupManifest>(reader.ReadToEnd(), JsonUtil.Options);
+            if (manifest is null)
+                return null;
+
+            var names = zip.Entries
+                .Select(e => e.FullName.Replace('\\', '/'))
+                .ToList();
+            var isPack = string.Equals(manifest.Kind, "workspacePack", StringComparison.OrdinalIgnoreCase)
+                         || names.Any(n => n.StartsWith("agents/", StringComparison.OrdinalIgnoreCase));
+            var agentCount = names
+                .Where(n => n.StartsWith("agents/", StringComparison.OrdinalIgnoreCase) && n.Length > 7)
+                .Select(n => n.Split('/', StringSplitOptions.RemoveEmptyEntries).Skip(1).FirstOrDefault() ?? "")
+                .Where(id => id.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Count();
+            return ToBackupInfo(zipPath, manifest, isPack, agentCount, new FileInfo(zipPath).Length);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static AgentBackupInfo? ToBackupInfo(
+        string path,
+        AgentBackupManifest manifest,
+        bool isPack,
+        int discoveredAgents,
+        long displayBytes)
+    {
+        if (!isPack && string.IsNullOrWhiteSpace(manifest.ComposerId))
+            return null;
+
+        var workspaceNames = manifest.Workspaces
+            .Select(w => string.IsNullOrWhiteSpace(w.Label) ? Path.GetFileName(w.FolderPath.TrimEnd('\\', '/')) : w.Label)
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (workspaceNames.Count == 0)
+        {
+            var fallback = string.IsNullOrWhiteSpace(manifest.SourceWorkspacePath)
+                ? null
+                : Path.GetFileName(manifest.SourceWorkspacePath.TrimEnd('\\', '/'));
+            if (!string.IsNullOrWhiteSpace(fallback))
+                workspaceNames.Add(fallback);
+        }
+
+        var agentCount = manifest.AgentCount > 0 ? manifest.AgentCount : Math.Max(isPack ? discoveredAgents : 1, 1);
+        var scope = workspaceNames.Count == 0
+            ? "Unknown workspace"
+            : string.Join(", ", workspaceNames.Take(3)) + (workspaceNames.Count > 3 ? $" +{workspaceNames.Count - 3}" : "");
+        var countText = isPack ? $"{agentCount} agent{(agentCount == 1 ? "" : "s")}" : "1 agent";
+        if (string.IsNullOrWhiteSpace(manifest.Title) && isPack)
+            manifest.Title = scope + " · " + countText;
+
+        var packed = BackupArchive.IsZip(path) ? "zip · " : "";
+        return new AgentBackupInfo
+        {
+            FolderPath = path,
+            Manifest = manifest,
+            Detail = $"{manifest.CreatedUtc.ToLocalTime():g} · {packed}{FileSizeFormatter.FromBytes(displayBytes)} · {countText} · {scope}"
+        };
     }
 
     private static IEnumerable<string> DiscoverSubagentStores(string? transcriptDir, string storesRoot)
@@ -245,6 +331,12 @@ public static class AgentCatalog
 
         return Path.GetFileName(transcriptDir);
     }
+
+    public static bool IsComposerId([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] string? id) =>
+        !string.IsNullOrWhiteSpace(id) && LooksLikeComposerId(id);
+
+    public static string GuessTitle(string? transcriptDir) =>
+        string.IsNullOrWhiteSpace(transcriptDir) ? "" : TitleFromTranscript(transcriptDir);
 
     private static bool LooksLikeComposerId(string id) =>
         Uuid.IsMatch(id) || id.StartsWith("bc-", StringComparison.OrdinalIgnoreCase);

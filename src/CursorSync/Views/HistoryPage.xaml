@@ -6,14 +6,13 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
-        <StackPanel Margin="0,0,12,16">
+        <StackPanel Style="{StaticResource PageHeader}">
             <TextBlock Text="History" Style="{StaticResource TitleText}"/>
-            <TextBlock Margin="0,6,0,0" Style="{StaticResource MutedText}"
+            <TextBlock Style="{StaticResource PageLead}"
                        Text="Recent copy operations on this machine."/>
         </StackPanel>
 
-        <Grid Grid.Row="1">
-                        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,12,12">
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Padding="0,0,12,12">
                 <ItemsControl ItemsSource="{Binding History}">
                     <ItemsControl.ItemTemplate>
                         <DataTemplate>
@@ -68,6 +67,5 @@
                     </ItemsControl.ItemTemplate>
                 </ItemsControl>
             </ScrollViewer>
-        </Grid>
     </Grid>
 </UserControl>

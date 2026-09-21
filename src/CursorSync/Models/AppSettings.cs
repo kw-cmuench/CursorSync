@@ -9,6 +9,7 @@ public sealed class AppSettings
     public ConflictPolicy ConflictPolicy { get; set; } = ConflictPolicy.NewerWins;
     public bool BackupBeforePull { get; set; } = true;
     public bool CloseCursorBeforeSync { get; set; }
+    public bool? ProtectCursorData { get; set; }
     public string? PathReplaceFrom { get; set; }
     public string? PathReplaceTo { get; set; }
     public Dictionary<string, bool> CategoryEnabled { get; set; } = new(StringComparer.OrdinalIgnoreCase);

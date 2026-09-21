@@ -70,6 +70,8 @@ public partial class MainViewModel : ObservableObject
 
         SelectedKind = SyncKind.TwoWay;
         Agents = new AgentTransferViewModel(this, _store);
+        WorkspaceManager = new WorkspaceManagerViewModel(this);
+        ProjectManager = new ProjectManagerViewModel(this);
         InitializeFromSettings();
         StatusBarText = "Starting…";
         IsBusy = true;
@@ -79,10 +81,14 @@ public partial class MainViewModel : ObservableObject
 
     public AppSettings Settings { get; }
     public AgentTransferViewModel Agents { get; }
+    public WorkspaceManagerViewModel WorkspaceManager { get; }
+    public ProjectManagerViewModel ProjectManager { get; }
     public ObservableCollection<CategoryItemViewModel> Categories { get; } = [];
     public IReadOnlyList<CategoryGroupViewModel> CategoryGroups { get; }
     public ObservableCollection<SyncHistoryEntry> History { get; } = [];
     public ObservableCollection<string> ActivityLog { get; } = [];
+    public ObservableCollection<IntegrityIssue> IntegrityIssues { get; } = [];
+    public ObservableCollection<IntegrityIssue> HubHealthIssues { get; } = [];
     public IReadOnlyList<HubSuggestion> SuggestedHubs { get; } = HubSuggestions.Suggest();
 
     [ObservableProperty] private AppPage _currentPage = AppPage.Dashboard;
@@ -109,16 +115,27 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty] private string? _statusMessage;
     [ObservableProperty] private bool _backupBeforePull;
     [ObservableProperty] private bool _closeCursorBeforeSync;
+    [ObservableProperty] private bool _protectCursorData = true;
     [ObservableProperty] private ConflictPolicy _conflictPolicy = ConflictPolicy.NewerWins;
     [ObservableProperty] private string? _cursorUserDataDir;
     [ObservableProperty] private string? _pathReplaceFrom;
     [ObservableProperty] private string? _pathReplaceTo;
     [ObservableProperty] private string? _confirmTitle;
     [ObservableProperty] private string? _confirmMessage;
+    [ObservableProperty] private string _confirmContinueText = "Continue";
+    [ObservableProperty] private bool _confirmIsDestructive = true;
     [ObservableProperty] private bool _isConfirmOpen;
     [ObservableProperty] private bool _isBusy;
     [ObservableProperty] private bool _isBusyIndeterminate = true;
     [ObservableProperty] private string _statusBarText = "Starting…";
+    [ObservableProperty] private string _integritySummary = "Not checked yet";
+    [ObservableProperty] private string _integrityDetail = "Run a check to see whether Cursor’s user data is consistent.";
+    [ObservableProperty] private string _integrityKind = "info";
+    [ObservableProperty] private bool _hasIntegrityIssues;
+    [ObservableProperty] private string _hubHealthSummary = "Not checked yet";
+    [ObservableProperty] private string _hubHealthDetail = "Checks that this PC can read and write the shared folder, and that copied databases and JSON look valid.";
+    [ObservableProperty] private string _hubHealthKind = "info";
+    [ObservableProperty] private bool _hasHubHealthIssues;
 
     private Action? _confirmAction;
     private int _scanGeneration;
@@ -129,17 +146,46 @@ public partial class MainViewModel : ObservableObject
     {
         if (value == AppPage.Agents)
             _ = Agents.RefreshCommand.ExecuteAsync(null);
+        else if (value == AppPage.Workspaces)
+            _ = WorkspaceManager.RefreshCommand.ExecuteAsync(null);
+        else if (value == AppPage.Projects)
+            _ = ProjectManager.RefreshCommand.ExecuteAsync(null);
     }
 
     public void Notify(string text, string kind) => ShowBanner(text, kind);
 
-    public void Confirm(string title, string message, Action action) => AskConfirm(title, message, action);
+    public void Confirm(
+        string title,
+        string message,
+        Action action,
+        CursorRisk cursorRisk = CursorRisk.None,
+        string continueText = "Continue")
+    {
+        RefreshCursorStatus();
+        if (IsCursorRunning && cursorRisk != CursorRisk.None)
+        {
+            AskConfirm(
+                cursorRisk == CursorRisk.High ? "Cursor is still running" : "Cursor is still open",
+                message.Trim() + Environment.NewLine + Environment.NewLine + DescribeAgentCursorRisk(cursorRisk),
+                action,
+                continueText: "Continue anyway",
+                destructive: cursorRisk == CursorRisk.High);
+            return;
+        }
+
+        AskConfirm(title, message, action, continueText);
+    }
 
     public void RefreshCursorStatus() => RefreshStatus();
 
     public void BeginBackgroundWork(string status)
     {
         _workDepth++;
+        SetBusyStatus(status);
+    }
+
+    public void SetBusyStatus(string status)
+    {
         IsBusy = true;
         IsBusyIndeterminate = true;
         StatusBarText = status;
@@ -160,11 +206,239 @@ public partial class MainViewModel : ObservableObject
         _store.SaveHistory(History.ToList());
     }
 
+    [RelayCommand]
+    private async Task CheckCursorDataAsync()
+    {
+        if (IsSyncing)
+            return;
+        BeginBackgroundWork("Checking Cursor data…");
+        try
+        {
+            RefreshCursorStatus();
+            var paths = CursorPaths.FromSettings(Settings);
+            var running = IsCursorRunning;
+            var report = await Task.Run(() => CursorIntegrityService.Inspect(paths, running));
+            ApplyIntegrity(report);
+        }
+        catch (Exception ex)
+        {
+            IntegritySummary = "Could not check Cursor data.";
+            IntegrityDetail = UserFacingError.From(ex);
+            IntegrityKind = "error";
+            Notify(UserFacingError.From(ex), "error");
+        }
+        finally
+        {
+            EndBackgroundWork();
+        }
+    }
+
+    [RelayCommand]
+    private async Task CheckHubHealthAsync()
+    {
+        if (IsSyncing)
+            return;
+
+        BeginBackgroundWork("Checking the sync folder…");
+        try
+        {
+            var report = await Task.Run(() => HubIntegrityService.Inspect(HubPath));
+            ApplyHubHealth(report);
+            Notify(report.Summary, report.HasErrors ? "error" : report.HasWarnings ? "warn" : "success");
+        }
+        catch (Exception ex)
+        {
+            HubHealthSummary = "Could not check the sync folder.";
+            HubHealthDetail = UserFacingError.From(ex);
+            HubHealthKind = "error";
+            Notify(UserFacingError.From(ex), "error");
+        }
+        finally
+        {
+            EndBackgroundWork();
+        }
+    }
+
+    public async Task<GuardedActionResult> GuardAsync(
+        string actionName,
+        IntegrityPlan plan,
+        Func<Task<bool>> work,
+        Action? onRollback = null)
+    {
+        RefreshCursorStatus();
+        plan = new IntegrityPlan
+        {
+            Action = plan.Action,
+            CursorRunning = IsCursorRunning,
+            TouchesSqlite = plan.TouchesSqlite,
+            TouchesWorkspaceStorage = plan.TouchesWorkspaceStorage,
+            DeletesWorkspace = plan.DeletesWorkspace,
+            DeletesProject = plan.DeletesProject,
+            Target = plan.Target,
+            NewFolder = plan.NewFolder,
+            Sources = plan.Sources,
+            AgentCount = plan.AgentCount,
+            ProjectCount = plan.ProjectCount
+        };
+
+        var paths = CursorPaths.FromSettings(Settings);
+        CursorIntegrityReport before;
+        BeginBackgroundWork("Checking Cursor data…");
+        try
+        {
+            before = await Task.Run(() => CursorIntegrityService.Inspect(paths, plan.CursorRunning));
+            ApplyIntegrity(before);
+        }
+        catch (Exception ex)
+        {
+            EndBackgroundWork();
+            Notify("Could not check Cursor data before this change: " + UserFacingError.From(ex), "error");
+            return GuardedActionResult.Abort();
+        }
+        EndBackgroundWork();
+
+        var predicted = CursorIntegrityService.Predict(plan, before);
+        if (predicted.HasErrors)
+        {
+            Notify(predicted.Issues.First(i => i.Severity == IntegritySeverity.Error).Message, "error");
+            return GuardedActionResult.Abort();
+        }
+
+        string? snapshot = null;
+        if (ProtectCursorData)
+        {
+            BeginBackgroundWork("Saving a safety snapshot…");
+            try
+            {
+                snapshot = await Task.Run(() => IntegritySnapshot.Capture(paths, _store.SafetyFolder));
+            }
+            catch (Exception ex)
+            {
+                EndBackgroundWork();
+                Notify("Could not create a safety snapshot, so the change was not applied: " + UserFacingError.From(ex), "error");
+                return GuardedActionResult.Abort();
+            }
+            EndBackgroundWork();
+        }
+
+        SqliteStateStore.PrepareForWrite();
+
+        Exception? thrown = null;
+        try
+        {
+            _ = await work();
+        }
+        catch (Exception ex)
+        {
+            thrown = ex;
+        }
+
+        CursorIntegrityReport after = before;
+        BeginBackgroundWork("Checking Cursor data…");
+        try
+        {
+            after = await Task.Run(() => CursorIntegrityService.Inspect(paths, IsCursorRunning));
+            ApplyIntegrity(after);
+        }
+        catch (Exception ex)
+        {
+            thrown ??= ex;
+        }
+        finally
+        {
+            EndBackgroundWork();
+        }
+
+        var worse = thrown is not null || CursorIntegrityService.IsWorse(before, after);
+        if (worse && snapshot is not null)
+        {
+            BeginBackgroundWork("Restoring the safety snapshot…");
+            try
+            {
+                await Task.Run(() => IntegritySnapshot.Restore(snapshot));
+                onRollback?.Invoke();
+                var restored = await Task.Run(() => CursorIntegrityService.Inspect(paths, IsCursorRunning));
+                ApplyIntegrity(restored);
+                Notify(
+                    thrown is not null
+                        ? $"{actionName} failed and was rolled back. {UserFacingError.From(thrown)}"
+                        : $"{actionName} made Cursor data worse, so the safety snapshot was restored.",
+                    "error");
+            }
+            catch (Exception ex)
+            {
+                try { onRollback?.Invoke(); }
+                catch { }
+                Notify(
+                    $"{actionName} may have broken Cursor data, and the rollback failed. The snapshot is at {snapshot}. {UserFacingError.From(ex)}",
+                    "error");
+            }
+            finally
+            {
+                EndBackgroundWork();
+            }
+
+            return GuardedActionResult.Rollback();
+        }
+
+        if (worse)
+        {
+            try { onRollback?.Invoke(); }
+            catch { /* snapshot may already have been restored */ }
+            Notify(
+                thrown is not null
+                    ? UserFacingError.From(thrown)
+                    : $"{actionName} finished, but Cursor data now looks worse. Turn on safety snapshots in Settings before trying again.",
+                "error");
+            return GuardedActionResult.Rollback();
+        }
+
+        if (thrown is not null)
+        {
+            IntegritySnapshot.Discard(snapshot);
+            Notify(UserFacingError.From(thrown), "error");
+            return new GuardedActionResult { Ran = true };
+        }
+
+        IntegritySnapshot.Discard(snapshot);
+        return GuardedActionResult.Ok();
+    }
+
+    private void ApplyIntegrity(CursorIntegrityReport report)
+    {
+        IntegritySummary = report.Summary;
+        IntegrityKind = report.HasErrors ? "error" : report.HasWarnings ? "warn" : "success";
+        IntegrityDetail = report.CheckedUtc.ToLocalTime().ToString("g")
+            + (ProtectCursorData
+                ? " · Risky changes are snapshotted and rolled back if this check fails."
+                : " · Safety snapshots are off.");
+        IntegrityIssues.Clear();
+        foreach (var issue in report.Issues.Take(8))
+            IntegrityIssues.Add(issue);
+        HasIntegrityIssues = IntegrityIssues.Count > 0;
+    }
+
+    private void ApplyHubHealth(CursorIntegrityReport report)
+    {
+        HubHealthSummary = report.Summary;
+        HubHealthKind = report.HasErrors ? "error" : report.HasWarnings ? "warn" : "success";
+        HubHealthDetail = report.CheckedUtc.ToLocalTime().ToString("g");
+        HubHealthIssues.Clear();
+        foreach (var issue in report.Issues.Take(8))
+            HubHealthIssues.Add(issue);
+        HasHubHealthIssues = HubHealthIssues.Count > 0;
+    }
+
     partial void OnHubPathChanged(string? value)
     {
         Settings.HubPath = value;
         SaveSettings();
         RefreshHubInfo();
+        HubHealthSummary = "Not checked yet";
+        HubHealthDetail = "Checks that this PC can read and write the shared folder, and that copied databases and JSON look valid.";
+        HubHealthKind = "info";
+        HubHealthIssues.Clear();
+        HasHubHealthIssues = false;
     }
 
     partial void OnMachineNameChanged(string value)
@@ -182,6 +456,12 @@ public partial class MainViewModel : ObservableObject
     partial void OnCloseCursorBeforeSyncChanged(bool value)
     {
         Settings.CloseCursorBeforeSync = value;
+        SaveSettings();
+    }
+
+    partial void OnProtectCursorDataChanged(bool value)
+    {
+        Settings.ProtectCursorData = value;
         SaveSettings();
     }
 
@@ -332,6 +612,78 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private void EmptyHub()
+    {
+        if (IsSyncing)
+        {
+            Notify("Wait for the current sync to finish before emptying the sync folder.", "warn");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(HubPath) || !Directory.Exists(HubPath))
+        {
+            Notify("Choose a sync folder first.", "warn");
+            return;
+        }
+
+        Confirm(
+            "Empty the sync folder?",
+            $"CursorSync will delete the payload and hub manifest in {HubPath}. Your project files and Cursor data on this PC are not touched. Other files in that folder stay. Other PCs will have nothing to pull until you push again.",
+            () => _ = EmptyHubAsync(),
+            continueText: "Empty folder");
+    }
+
+    private async Task EmptyHubAsync()
+    {
+        BeginBackgroundWork("Emptying the sync folder…");
+        try
+        {
+            var hub = HubPath;
+            if (string.IsNullOrWhiteSpace(hub))
+            {
+                Notify("Choose a sync folder first.", "warn");
+                return;
+            }
+
+            var result = await Task.Run(() => HubIntegrityService.Empty(hub));
+            AddHistory(new SyncHistoryEntry
+            {
+                Utc = DateTime.UtcNow,
+                Kind = "Empty sync folder",
+                Machine = Settings.MachineName,
+                Success = result.Success,
+                Error = result.Error,
+                FilesCopied = result.Removed,
+                Warnings = result.Warnings.ToList(),
+                HubPath = hub ?? ""
+            });
+
+            RefreshHubInfo();
+            try
+            {
+                ApplyHubHealth(HubIntegrityService.Inspect(hub));
+            }
+            catch
+            {
+                // health check is secondary
+            }
+
+            if (result.Success)
+                Notify(result.Message ?? "The sync folder was emptied.", result.Warnings.Count > 0 ? "warn" : "success");
+            else
+                Notify(result.Error ?? "Could not empty the sync folder.", "error");
+        }
+        catch (Exception ex)
+        {
+            Notify(UserFacingError.From(ex), "error");
+        }
+        finally
+        {
+            EndBackgroundWork();
+        }
+    }
+
+    [RelayCommand]
     private void OpenBackups()
     {
         Directory.CreateDirectory(_store.BackupsFolder);
@@ -370,12 +722,32 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
+        RefreshStatus();
+        var risk = GetSyncCursorRisk(selected);
+
         if (SelectedKind == SyncKind.Pull)
         {
+            var message = "This overwrites local Cursor files for the selected categories. A backup is created first if that option is on.";
+            if (risk != CursorRisk.None)
+                message += Environment.NewLine + Environment.NewLine + DescribeSyncCursorRisk(selected);
+
             AskConfirm(
-                "Pull from the sync folder?",
-                "This overwrites local Cursor files for the selected categories. A backup is created first if that option is on.",
-                () => _ = ExecuteSyncAsync(selected));
+                risk != CursorRisk.None ? "Pull while Cursor is open?" : "Pull from the sync folder?",
+                message,
+                () => _ = ExecuteSyncAsync(selected),
+                continueText: risk != CursorRisk.None ? "Continue anyway" : "Continue",
+                destructive: true);
+            return;
+        }
+
+        if (risk != CursorRisk.None)
+        {
+            AskConfirm(
+                risk == CursorRisk.High ? "Cursor is still running" : "Cursor is still open",
+                DescribeSyncCursorRisk(selected),
+                () => _ = ExecuteSyncAsync(selected),
+                continueText: "Continue anyway",
+                destructive: risk == CursorRisk.High);
             return;
         }
 
@@ -434,6 +806,7 @@ public partial class MainViewModel : ObservableObject
         MachineName = Settings.MachineName;
         BackupBeforePull = Settings.BackupBeforePull;
         CloseCursorBeforeSync = Settings.CloseCursorBeforeSync;
+        ProtectCursorData = Settings.ProtectCursorData ?? true;
         ConflictPolicy = Settings.ConflictPolicy;
         CursorUserDataDir = Settings.CursorUserDataDir;
         PathReplaceFrom = Settings.PathReplaceFrom;
@@ -504,12 +877,43 @@ public partial class MainViewModel : ObservableObject
         SyncResult result;
         try
         {
-            result = await _engine.RunAsync(
-                SelectedKind,
-                Settings,
-                selected.Select(c => c.Definition).ToList(),
-                progress,
-                _syncCts.Token);
+            if (SelectedKind is SyncKind.Pull or SyncKind.TwoWay)
+            {
+                SyncResult? captured = null;
+                var guard = await GuardAsync(
+                    "Sync",
+                    IntegrityPlan.Sync(writesLocal: true),
+                    async () =>
+                    {
+                        captured = await _engine.RunAsync(
+                            SelectedKind,
+                            Settings,
+                            selected.Select(c => c.Definition).ToList(),
+                            progress,
+                            _syncCts.Token);
+                        return captured.Success;
+                    });
+
+                if (guard.Aborted || guard.RolledBack)
+                    result = new SyncResult
+                    {
+                        Success = false,
+                        Error = guard.RolledBack
+                            ? "Sync was rolled back because Cursor data no longer looked consistent."
+                            : "Sync was not started because it looked unsafe."
+                    };
+                else
+                    result = captured ?? new SyncResult { Success = false, Error = "Sync did not return a result." };
+            }
+            else
+            {
+                result = await _engine.RunAsync(
+                    SelectedKind,
+                    Settings,
+                    selected.Select(c => c.Definition).ToList(),
+                    progress,
+                    _syncCts.Token);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -517,7 +921,7 @@ public partial class MainViewModel : ObservableObject
         }
         catch (Exception ex)
         {
-            result = new SyncResult { Success = false, Error = ex.Message };
+            result = new SyncResult { Success = false, Error = UserFacingError.From(ex) };
         }
         finally
         {
@@ -581,10 +985,47 @@ public partial class MainViewModel : ObservableObject
         _ => "Two-way sync"
     };
 
-    private void AskConfirm(string title, string message, Action action)
+    private CursorRisk GetSyncCursorRisk(IReadOnlyList<CategoryItemViewModel> selected)
+    {
+        if (!IsCursorRunning)
+            return CursorRisk.None;
+
+        if (selected.Any(c => c.RequiresCursorClosed))
+            return CursorRisk.High;
+
+        return SelectedKind is SyncKind.Pull or SyncKind.TwoWay ? CursorRisk.Medium : CursorRisk.None;
+    }
+
+    private string DescribeSyncCursorRisk(IReadOnlyList<CategoryItemViewModel> selected)
+    {
+        var parts = new List<string>();
+        var locked = selected.Where(c => c.RequiresCursorClosed).Select(c => c.Title).ToList();
+        if (locked.Count > 0)
+        {
+            parts.Add("High risk: " + string.Join(", ", locked)
+                + " use databases Cursor keeps open. Those categories will be skipped while Cursor is running, so this sync will be incomplete.");
+        }
+
+        if (SelectedKind is SyncKind.Pull or SyncKind.TwoWay)
+        {
+            parts.Add("Medium risk: settings and other files Cursor already has open can be overwritten when Cursor saves, or they may not show up until you restart it.");
+        }
+
+        parts.Add("Close Cursor completely (including the tray), then run this again. Continue anyway only if you accept an incomplete or overwritten result.");
+        return string.Join(Environment.NewLine + Environment.NewLine, parts);
+    }
+
+    private static string DescribeAgentCursorRisk(CursorRisk risk) =>
+        risk == CursorRisk.High
+            ? "High risk: Cursor is using the chat database. Files can still copy, but backups may miss the sidebar snapshot and restored agents may stay hidden until Cursor is fully closed and you try again. Quit Cursor completely (including the tray)."
+            : "Medium risk: Cursor may overwrite files it still has open, or ignore the new copies until you restart it. Close Cursor completely (including the tray).";
+
+    private void AskConfirm(string title, string message, Action action, string continueText = "Continue", bool destructive = true)
     {
         ConfirmTitle = title;
         ConfirmMessage = message;
+        ConfirmContinueText = continueText;
+        ConfirmIsDestructive = destructive;
         _confirmAction = action;
         IsConfirmOpen = true;
     }
@@ -613,11 +1054,12 @@ public partial class MainViewModel : ObservableObject
             await RefreshStatusAsync();
             RefreshHubInfo();
             await RefreshSizesAsync();
+            await CheckCursorDataAsync();
         }
         catch (Exception ex)
         {
             StatusBarText = "Startup check failed.";
-            ShowBanner(ex.Message, "error");
+            ShowBanner(UserFacingError.From(ex), "error");
             IsBusy = false;
         }
     }
@@ -751,7 +1193,7 @@ public partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             StatusBarText = "Could not measure local data.";
-            ShowBanner(ex.Message, "warn");
+            ShowBanner(UserFacingError.From(ex), "warn");
         }
         finally
         {

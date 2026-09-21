@@ -7,17 +7,23 @@
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
-        <Grid Margin="0,0,12,16">
-            <StackPanel>
-                <TextBlock Text="Data to sync" Style="{StaticResource TitleText}"/>
-                <TextBlock Margin="0,6,0,0" Style="{StaticResource MutedText}"
-                           Text="Only enabled categories are copied. Leave bulky items off unless you really need them."/>
-            </StackPanel>
-            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Bottom">
+        <Grid Style="{StaticResource PageHeader}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Text="Data to sync" Style="{StaticResource TitleText}" VerticalAlignment="Center"/>
+            <StackPanel Grid.Column="1" Style="{StaticResource PageHeaderActions}">
                 <Button Content="Recommended" Style="{StaticResource GhostButton}" Command="{Binding EnableRecommendedCommand}"/>
                 <Button Content="All" Style="{StaticResource GhostButton}" Margin="8,0,0,0" Command="{Binding EnableAllCommand}"/>
                 <Button Content="None" Style="{StaticResource GhostButton}" Margin="8,0,0,0" Command="{Binding EnableNoneCommand}"/>
             </StackPanel>
+            <TextBlock Grid.Row="1" Style="{StaticResource PageLead}"
+                       Text="Only enabled categories are copied. Leave bulky items off unless you really need them."/>
         </Grid>
 
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Padding="0,0,12,12">

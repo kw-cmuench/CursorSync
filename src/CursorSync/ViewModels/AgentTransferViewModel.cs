@@ -12,8 +12,8 @@ public partial class AgentTransferViewModel : ObservableObject
     private readonly MainViewModel _host;
     private readonly SettingsStore _store;
     private readonly AgentTransferService _transfer = new();
-    private List<AgentRecord> _agents = [];
     private List<CursorWorkspaceInfo> _workspaces = [];
+    private readonly List<WorkspaceGroupViewModel> _allGroups = [];
 
     public AgentTransferViewModel(MainViewModel host, SettingsStore store)
     {
@@ -22,92 +22,65 @@ public partial class AgentTransferViewModel : ObservableObject
         IncludeTranscript = true;
         IncludeStore = true;
         IncludeWaypoints = true;
+        Preview = new ConversationPreview();
+        UpdateSelectionSummary();
+        UpdateRestoreHint();
     }
 
-    public ObservableCollection<WorkspaceOption> WorkspaceFilters { get; } = [];
+    public ObservableCollection<WorkspaceGroupViewModel> Workspaces { get; } = [];
     public ObservableCollection<WorkspaceOption> TargetWorkspaces { get; } = [];
-    public ObservableCollection<AgentItemViewModel> Agents { get; } = [];
     public ObservableCollection<AgentBackupInfo> Backups { get; } = [];
 
-    [ObservableProperty] private WorkspaceOption? _selectedWorkspaceFilter;
     [ObservableProperty] private WorkspaceOption? _selectedTargetWorkspace;
-    [ObservableProperty] private AgentItemViewModel? _selectedAgent;
     [ObservableProperty] private AgentBackupInfo? _selectedBackup;
+    [ObservableProperty] private AgentItemViewModel? _focusedAgent;
+    [ObservableProperty] private ConversationPreview _preview;
     [ObservableProperty] private string _searchText = "";
     [ObservableProperty] private bool _includeTranscript = true;
     [ObservableProperty] private bool _includeStore = true;
     [ObservableProperty] private bool _includeWaypoints = true;
+    [ObservableProperty] private bool _forceRestoreTarget;
     [ObservableProperty] private bool _isLoading;
     [ObservableProperty] private string _emptyAgentsText = "No agents found yet.";
     [ObservableProperty] private bool _showEmptyAgents = true;
+    [ObservableProperty] private string _selectionSummary = "Nothing selected";
+    [ObservableProperty] private string _backupButtonText = "Back up selected";
+    [ObservableProperty] private string _restoreHint = "Select a saved backup, then choose whether agents return to their original folders or one destination.";
 
-    partial void OnSelectedWorkspaceFilterChanged(WorkspaceOption? value) => ApplyAgentFilter();
-    partial void OnSearchTextChanged(string value) => ApplyAgentFilter();
+    partial void OnSearchTextChanged(string value) => ApplyFilter();
+    partial void OnFocusedAgentChanged(AgentItemViewModel? value)
+    {
+        foreach (var agent in _allGroups.SelectMany(g => g.Agents))
+            agent.IsPreviewing = agent == value;
+        Preview = ConversationPreviewService.Load(value?.Record);
+    }
+    partial void OnForceRestoreTargetChanged(bool value) => UpdateRestoreHint();
+    partial void OnSelectedBackupChanged(AgentBackupInfo? value) => UpdateRestoreHint();
+    partial void OnSelectedTargetWorkspaceChanged(WorkspaceOption? value) => UpdateRestoreHint();
 
     [RelayCommand]
     private async Task RefreshAsync()
     {
         IsLoading = true;
-        _host.BeginBackgroundWork("Scanning agents and workspaces…");
+        _host.BeginBackgroundWork("Scanning workspaces and agents…");
         try
         {
             var settings = _host.Settings;
-            var paths = CursorPaths.FromSettings(settings);
-            var agents = await Task.Run(() => AgentCatalog.ListLocal(paths, CancellationToken.None));
-            var workspaces = CursorWorkspaceLocator.List(paths);
-            var backups = AgentCatalog.ListBackups(BackupRoots(settings));
-
-            _agents = agents.ToList();
-            _workspaces = workspaces.ToList();
-
-            var previousFilter = SelectedWorkspaceFilter?.Id;
-            var previousTarget = SelectedTargetWorkspace?.Id;
-            var previousAgent = SelectedAgent?.Id;
-            var previousBackup = SelectedBackup?.FolderPath;
-
-            WorkspaceFilters.Clear();
-            WorkspaceFilters.Add(new WorkspaceOption { Id = "", Label = "All workspaces", FolderPath = "" });
-            foreach (var workspace in _workspaces)
+            var roots = BackupRoots(settings).ToList();
+            var snapshot = await Task.Run(() =>
             {
-                WorkspaceFilters.Add(new WorkspaceOption
-                {
-                    Id = workspace.Id,
-                    Label = workspace.Label,
-                    FolderPath = workspace.FolderPath,
-                    Info = workspace
-                });
-            }
-
-            TargetWorkspaces.Clear();
-            foreach (var workspace in _workspaces)
-            {
-                TargetWorkspaces.Add(new WorkspaceOption
-                {
-                    Id = workspace.Id,
-                    Label = $"{workspace.Label}  —  {workspace.FolderPath}",
-                    FolderPath = workspace.FolderPath,
-                    Info = workspace
-                });
-            }
-
-            Backups.Clear();
-            foreach (var backup in backups)
-                Backups.Add(backup);
-
-            SelectedWorkspaceFilter = WorkspaceFilters.FirstOrDefault(w => w.Id == previousFilter) ?? WorkspaceFilters[0];
-            SelectedTargetWorkspace = TargetWorkspaces.FirstOrDefault(w => w.Id == previousTarget)
-                ?? TargetWorkspaces.FirstOrDefault();
-            ApplyAgentFilter();
-            SelectedAgent = Agents.FirstOrDefault(a => a.Id == previousAgent) ?? Agents.FirstOrDefault();
-            SelectedBackup = Backups.FirstOrDefault(b => b.FolderPath == previousBackup) ?? Backups.FirstOrDefault();
-
-            EmptyAgentsText = _agents.Count == 0
-                ? "No local agent transcripts were found. Open a chat in Cursor first."
-                : "No agents match this filter.";
+                var paths = CursorPaths.FromSettings(settings);
+                return (
+                    Agents: AgentCatalog.ListLocal(paths, CancellationToken.None),
+                    Workspaces: CursorWorkspaceLocator.List(paths),
+                    Backups: AgentCatalog.ListBackups(roots)
+                );
+            });
+            ApplyCatalog(snapshot.Agents, snapshot.Workspaces, snapshot.Backups);
         }
         catch (Exception ex)
         {
-            _host.Notify(ex.Message, "error");
+            _host.Notify(UserFacingError.From(ex), "error");
         }
         finally
         {
@@ -116,12 +89,117 @@ public partial class AgentTransferViewModel : ObservableObject
         }
     }
 
+    private async Task RefreshBackupListAsync(string? preferPath = null)
+    {
+        _host.BeginBackgroundWork("Updating backup list…");
+        try
+        {
+            var roots = BackupRoots(_host.Settings).ToList();
+            var previousBackup = preferPath ?? SelectedBackup?.FolderPath;
+            var backups = await Task.Run(() => AgentCatalog.ListBackups(roots));
+            Backups.Clear();
+            foreach (var backup in backups)
+                Backups.Add(backup);
+            SelectedBackup = Backups.FirstOrDefault(b => string.Equals(b.FolderPath, previousBackup, StringComparison.OrdinalIgnoreCase))
+                ?? Backups.FirstOrDefault();
+            UpdateRestoreHint();
+        }
+        catch (Exception ex)
+        {
+            _host.Notify(UserFacingError.From(ex), "error");
+        }
+        finally
+        {
+            _host.EndBackgroundWork();
+        }
+    }
+
+    private void ApplyCatalog(
+        IReadOnlyList<AgentRecord> agents,
+        IReadOnlyList<CursorWorkspaceInfo> workspaces,
+        IReadOnlyList<AgentBackupInfo> backups)
+    {
+        _workspaces = workspaces.ToList();
+
+        var checkedIds = _allGroups
+            .SelectMany(g => g.Agents)
+            .Where(a => a.IsSelected)
+            .Select(a => a.Id)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var hadSelection = checkedIds.Count > 0;
+        var previousFocus = FocusedAgent?.Id;
+        var previousBackup = SelectedBackup?.FolderPath;
+        var previousTarget = SelectedTargetWorkspace?.Id;
+
+        _allGroups.Clear();
+        var assigned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var workspace in workspaces)
+        {
+            var groupAgents = agents
+                .Where(a => a.WorkspaceId == workspace.Id
+                            || CursorWorkspaceLocator.SameFolder(a.WorkspacePath, workspace.FolderPath))
+                .ToList();
+            foreach (var agent in groupAgents)
+                assigned.Add(agent.ComposerId);
+            if (groupAgents.Count == 0)
+                continue;
+            _allGroups.Add(CreateGroup(workspace, groupAgents, checkedIds, hadSelection));
+        }
+
+        var leftover = agents.Where(a => !assigned.Contains(a.ComposerId)).ToList();
+        if (leftover.Count > 0)
+            _allGroups.Add(CreateGroup(null, leftover, checkedIds, hadSelection, "Other / unknown workspace", ""));
+
+        TargetWorkspaces.Clear();
+        foreach (var workspace in workspaces)
+        {
+            TargetWorkspaces.Add(new WorkspaceOption
+            {
+                Id = workspace.Id,
+                Label = workspace.Label,
+                FolderPath = workspace.FolderPath,
+                Info = workspace
+            });
+        }
+
+        Backups.Clear();
+        foreach (var backup in backups)
+            Backups.Add(backup);
+
+        SelectedTargetWorkspace = TargetWorkspaces.FirstOrDefault(w => w.Id == previousTarget)
+            ?? TargetWorkspaces.FirstOrDefault();
+        SelectedBackup = Backups.FirstOrDefault(b => b.FolderPath == previousBackup) ?? Backups.FirstOrDefault();
+        ApplyFilter();
+        FocusedAgent = Workspaces.SelectMany(g => g.Agents).FirstOrDefault(a => a.Id == previousFocus)
+            ?? Workspaces.SelectMany(g => g.Agents).FirstOrDefault();
+        EmptyAgentsText = agents.Count == 0
+            ? "No local agents were found. Open a chat in Cursor first, then refresh."
+            : "No workspaces match this search.";
+    }
+
+    [RelayCommand]
+    private void SelectAll()
+    {
+        foreach (var group in Workspaces)
+            group.SetChecked(true);
+        UpdateSelectionSummary();
+    }
+
+    [RelayCommand]
+    private void SelectNone()
+    {
+        foreach (var group in Workspaces)
+            group.SetChecked(false);
+        UpdateSelectionSummary();
+    }
+
     [RelayCommand]
     private void BrowseTargetWorkspace()
     {
         var dialog = new OpenFolderDialog
         {
-            Title = "Choose the workspace to restore into",
+            Title = "Choose the workspace folder to restore into",
             Multiselect = false
         };
         if (dialog.ShowDialog() != true)
@@ -130,7 +208,7 @@ public partial class AgentTransferViewModel : ObservableObject
         var match = CursorWorkspaceLocator.FindByFolder(_workspaces, dialog.FolderName);
         if (match is null)
         {
-            _host.Notify("Open that folder in Cursor once first, then refresh. CursorSync can only restore into workspaces Cursor already knows.", "warn");
+            _host.Notify("Open that folder in Cursor once, then refresh. Restore can only target workspaces Cursor already knows.", "warn");
             return;
         }
 
@@ -140,43 +218,23 @@ public partial class AgentTransferViewModel : ObservableObject
     [RelayCommand]
     private void BackupSelected()
     {
-        if (SelectedAgent is null)
+        var selected = SelectedAgents();
+        if (selected.Count == 0)
         {
-            _host.Notify("Select an agent to back up.", "warn");
+            _host.Notify("Check one or more workspaces (or agents) to back up.", "warn");
             return;
         }
 
-        _ = RunBackupAsync(SelectedAgent.Record);
-    }
-
-    [RelayCommand]
-    private void RestoreSelectedAgent()
-    {
-        if (SelectedAgent is null)
-        {
-            _host.Notify("Select an agent to copy.", "warn");
-            return;
-        }
-
-        var target = SelectedTargetWorkspace?.Info;
-        if (target is null)
-        {
-            _host.Notify("Choose a target workspace.", "warn");
-            return;
-        }
-
-        if (string.Equals(CursorWorkspaceLocator.NormalizeFolder(target.FolderPath),
-                CursorWorkspaceLocator.NormalizeFolder(SelectedAgent.Record.WorkspacePath ?? ""),
-                StringComparison.OrdinalIgnoreCase))
-        {
-            _host.Notify("Pick a different workspace than the one this agent already belongs to.", "warn");
-            return;
-        }
-
+        var workspaces = selected
+            .Select(a => a.WorkspaceLabel ?? "Unknown")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
         _host.Confirm(
-            "Restore this agent to another workspace?",
-            $"A copy of “{SelectedAgent.Title}” will be registered in {target.Label}. The original stays where it is. Close Cursor so the chat list can be updated.",
-            () => _ = RestoreLiveAsync(SelectedAgent.Record, target));
+            "Back up selected workspaces?",
+            $"{selected.Count} agent{(selected.Count == 1 ? "" : "s")} from {workspaces.Count} workspace{(workspaces.Count == 1 ? "" : "s")} will be saved locally"
+            + (string.IsNullOrWhiteSpace(_host.Settings.HubPath) ? "." : " and copied to your sync folder."),
+            () => _ = RunBackupAsync(selected),
+            CursorRisk.High);
     }
 
     [RelayCommand]
@@ -184,21 +242,234 @@ public partial class AgentTransferViewModel : ObservableObject
     {
         if (SelectedBackup is null)
         {
-            _host.Notify("Select a backup to restore.", "warn");
+            _host.Notify("Select a saved backup first.", "warn");
             return;
         }
 
         var target = SelectedTargetWorkspace?.Info;
+        if (ForceRestoreTarget && target is null)
+        {
+            _host.Notify("Choose the workspace that should receive the agents.", "warn");
+            return;
+        }
+
+        var label = SelectedBackup.Label;
+        _host.Confirm(
+            "Restore this backup?",
+            ForceRestoreTarget
+                ? $"All agents in “{label}” will be copied into {target?.Label}. Originals stay in the backup. Close Cursor so the sidebar can update."
+                : $"“{label}” will be restored into matching workspaces on this PC. Unmatched agents go to {target?.Label ?? "the selected workspace"}. Close Cursor so the sidebar can update.",
+            () => _ = RestoreBackupAsync(SelectedBackup.FolderPath, target),
+            CursorRisk.High);
+    }
+
+    [RelayCommand]
+    private void ImportZip()
+    {
+        Directory.CreateDirectory(_store.AgentBackupsFolder);
+        var dialog = new OpenFileDialog
+        {
+            Title = "Choose an agent backup zip",
+            Filter = "Zip archives (*.zip)|*.zip|All files (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false,
+            InitialDirectory = _store.AgentBackupsFolder
+        };
+        if (dialog.ShowDialog() == true)
+            _ = PrepareImportAsync(dialog.FileName);
+    }
+
+    [RelayCommand]
+    private void ImportFolder()
+    {
+        var dialog = new OpenFolderDialog
+        {
+            Title = "Choose a backup folder (CursorSync pack, copied ~/.cursor/projects, or sync payload)",
+            Multiselect = false
+        };
+        if (dialog.ShowDialog() == true)
+            _ = PrepareImportAsync(dialog.FolderName);
+    }
+
+    private async Task PrepareImportAsync(string path)
+    {
+        _host.BeginBackgroundWork("Checking the backup…");
+        AgentImportInspection inspection;
+        try
+        {
+            inspection = await Task.Run(() => AgentImportService.Inspect(path));
+        }
+        catch (Exception ex)
+        {
+            _host.EndBackgroundWork();
+            _host.Notify(UserFacingError.From(ex), "error");
+            return;
+        }
+        _host.EndBackgroundWork();
+
+        if (!inspection.CanImport)
+        {
+            var first = inspection.Report.Issues.FirstOrDefault(i => i.Severity == IntegritySeverity.Error)?.Message
+                        ?? inspection.Summary;
+            _host.Notify(first, "error");
+            return;
+        }
+
+        var target = SelectedTargetWorkspace?.Info;
+        if (_workspaces.Count == 0)
+        {
+            _host.Notify("Open a folder in Cursor first so there is a real workspace to import into.", "warn");
+            return;
+        }
+
+        if (ForceRestoreTarget && target is null)
+        {
+            _host.Notify("Choose the workspace that should receive the imported agents.", "warn");
+            return;
+        }
+
+        var extra = "";
+        if (inspection.Report.HasWarnings)
+        {
+            var warnings = inspection.Report.Issues
+                .Where(i => i.Severity == IntegritySeverity.Warning)
+                .Select(i => i.Message)
+                .Take(3);
+            extra = Environment.NewLine + Environment.NewLine + string.Join(Environment.NewLine, warnings);
+        }
+
+        var destination = ForceRestoreTarget
+            ? $"All of them will be copied into “{target?.Label}”."
+            : $"Matching folders on this PC get their agents back. Anything unmatched uses “{target?.Label ?? "the selected workspace"}”.";
+
+        _host.Confirm(
+            "Import this backup?",
+            $"Integrity check passed. {inspection.Summary}. {destination} Originals stay in the backup. Close Cursor so the sidebar can update.{extra}",
+            () => _ = ImportBackupAsync(path, target, inspection.AgentCount),
+            CursorRisk.High,
+            "Import");
+    }
+
+    private async Task ImportBackupAsync(string path, CursorWorkspaceInfo? fallback, int agentCount)
+    {
+        if (!await EnsureCursorClosedForDatabaseAsync())
+            return;
+
+        try
+        {
+            AgentTransferResult? result = null;
+            var guard = await _host.GuardAsync(
+                "Importing agents",
+                IntegrityPlan.Import(fallback, agentCount),
+                async () =>
+                {
+                    result = await ExecuteAsync("Importing agents…", progress =>
+                        AgentImportService.Import(
+                            path,
+                            _workspaces,
+                            fallback,
+                            CursorPaths.FromSettings(_host.Settings),
+                            IncludeTranscript,
+                            IncludeStore,
+                            IncludeWaypoints,
+                            ForceRestoreTarget,
+                            progress,
+                            CancellationToken.None));
+                    return result.Success;
+                });
+            if (!guard.Completed || result is null)
+                return;
+
+            RecordHistory("Import agents", result, Path.GetFileName(path.TrimEnd('\\', '/')));
+            if (result.Success)
+            {
+                var extra = result.Warnings.Count > 0 ? " " + result.Warnings[0] : " Reopen Cursor on the target folder to see the agents.";
+                _host.Notify($"Imported {agentCount} agent{(agentCount == 1 ? "" : "s")} — {result.FilesCopied} files.{extra}",
+                    result.Warnings.Count > 0 ? "warn" : "success");
+                await RefreshAsync();
+            }
+            else
+            {
+                _host.Notify(result.Error ?? "Import failed the integrity check or could not copy the agents.", "error");
+            }
+        }
+        catch (Exception ex)
+        {
+            _host.Notify(UserFacingError.From(ex), "error");
+        }
+    }
+
+    [RelayCommand]
+    private void CopySelectedToWorkspace()
+    {
+        var selected = SelectedAgents();
+        var target = SelectedTargetWorkspace?.Info;
+        if (selected.Count == 0)
+        {
+            _host.Notify("Check the agents you want to copy.", "warn");
+            return;
+        }
         if (target is null)
         {
-            _host.Notify("Choose a target workspace.", "warn");
+            _host.Notify("Choose a destination workspace on the right.", "warn");
             return;
         }
 
         _host.Confirm(
-            "Restore this backup?",
-            $"“{SelectedBackup.Label}” will be copied into {target.Label} as a new agent. Close Cursor so it can appear in the sidebar.",
-            () => _ = RestoreBackupAsync(SelectedBackup.FolderPath, target));
+            "Copy agents into this workspace?",
+            $"{selected.Count} agent{(selected.Count == 1 ? "" : "s")} will be copied into {target.Label}. The originals stay where they are. Close Cursor so the new copies appear.",
+            () => _ = CopyLiveAsync(selected, target),
+            CursorRisk.High);
+    }
+
+    [RelayCommand]
+    private void AssignSelectedToWorkspace()
+    {
+        var selected = SelectedAgents();
+        var target = SelectedTargetWorkspace?.Info;
+        if (selected.Count == 0)
+        {
+            _host.Notify("Check the agents you want to assign.", "warn");
+            return;
+        }
+        if (target is null)
+        {
+            _host.Notify("Choose a destination workspace on the right.", "warn");
+            return;
+        }
+
+        _host.Confirm(
+            "Assign agents to this workspace?",
+            $"{selected.Count} agent{(selected.Count == 1 ? "" : "s")} will move into {target.Label}, including transcripts and memory. Composer IDs stay the same, so this is a move rather than a copy. Close Cursor so the sidebar can update.",
+            () => _ = AssignLiveAsync(selected, target),
+            CursorRisk.High);
+    }
+
+    [RelayCommand]
+    private void DeleteSelectedAgents()
+    {
+        var selected = SelectedAgents();
+        if (selected.Count == 0)
+        {
+            _host.Notify("Check one or more chats to delete.", "warn");
+            return;
+        }
+
+        var names = selected.Count == 1
+            ? $"“{selected[0].Title}”"
+            : $"{selected.Count} chats";
+        var scope = selected
+            .Select(agent => agent.WorkspaceLabel ?? "Unknown workspace")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var where = scope.Count == 1 ? $" in {scope[0]}" : $" across {scope.Count} workspaces";
+
+        _host.Confirm(
+            selected.Count == 1 ? "Delete this chat?" : "Delete these chats?",
+            $"{names}{where} will be removed from Cursor’s sidebar, including transcripts and memory for those chats. Your project files are not deleted. Close Cursor first. A safety snapshot can roll this back if that setting is on.",
+            () => _ = DeleteSelectedAsync(selected),
+            CursorRisk.High,
+            selected.Count == 1 ? "Delete chat" : "Delete chats");
     }
 
     [RelayCommand]
@@ -212,89 +483,318 @@ public partial class AgentTransferViewModel : ObservableObject
         });
     }
 
-    private async Task RunBackupAsync(AgentRecord agent)
+    [RelayCommand]
+    private void FocusAgent(AgentItemViewModel? agent)
     {
-        var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-        var localFolder = Path.Combine(_store.AgentBackupsFolder, $"{stamp}-{SafeName(agent.Title)}");
-        Directory.CreateDirectory(localFolder);
+        if (agent is not null)
+            FocusedAgent = agent;
+    }
 
-        var result = await ExecuteAsync("Backing up agent…", progress =>
-            _transfer.Backup(agent, CursorPaths.FromSettings(_host.Settings), localFolder,
-                IncludeTranscript, IncludeStore, IncludeWaypoints, progress, CancellationToken.None));
+    public void OnGroupChanged() => UpdateSelectionSummary();
 
-        if (result.Success && !string.IsNullOrWhiteSpace(_host.Settings.HubPath))
+    private void UpdateRestoreHint()
+    {
+        var destination = SelectedTargetWorkspace?.Label ?? "the destination workspace";
+        if (SelectedBackup is null)
         {
-            try
-            {
-                var hubFolder = Path.Combine(_host.Settings.HubPath, "payload", "agent-transfers", Path.GetFileName(localFolder));
-                CopyDirectory(localFolder, hubFolder);
-                result = result with { OutputPath = hubFolder };
-            }
-            catch (Exception ex)
-            {
-                _host.Notify("Local backup succeeded, but copying to the sync folder failed: " + ex.Message, "warn");
-            }
+            RestoreHint = ForceRestoreTarget
+                ? $"No backup selected yet. Restores and imports will send every agent into {destination}."
+                : "Select a saved backup, or import a zip / copied folder. Agents return to their original workspaces when those folders exist here.";
+            return;
         }
 
-        RecordHistory("Agent backup", result, agent.Title);
-        if (result.Success)
+        RestoreHint = ForceRestoreTarget
+            ? $"“{SelectedBackup.Label}” will be copied entirely into {destination}."
+            : $"“{SelectedBackup.Label}” returns to matching folders on this PC. Anything unmatched uses {destination}.";
+    }
+
+    private WorkspaceGroupViewModel CreateGroup(
+        CursorWorkspaceInfo? info,
+        List<AgentRecord> agents,
+        HashSet<string> checkedIds,
+        bool hadSelection,
+        string? fallbackLabel = null,
+        string? fallbackPath = null)
+    {
+        var group = new WorkspaceGroupViewModel(
+            info,
+            info?.Label ?? fallbackLabel ?? "Unknown workspace",
+            info?.FolderPath ?? fallbackPath ?? "",
+            OnGroupChanged);
+        foreach (var agent in agents)
         {
-            _host.Notify($"Backup saved — {result.FilesCopied} files · {FileSizeFormatter.FromBytes(result.BytesCopied)}", "success");
-            await RefreshAsync();
+            var item = new AgentItemViewModel(agent, group);
+            item.SetSelected(hadSelection ? checkedIds.Contains(agent.ComposerId) : false);
+            group.Agents.Add(item);
         }
-        else
+
+        group.RefreshState();
+        return group;
+    }
+
+    private void ApplyFilter()
+    {
+        var query = SearchText?.Trim() ?? "";
+        Workspaces.Clear();
+        foreach (var group in _allGroups)
         {
-            _host.Notify(result.Error ?? "Backup failed.", "error");
+            group.ApplyFilter(query);
+            if (group.IsVisible)
+                Workspaces.Add(group);
+        }
+
+        ShowEmptyAgents = Workspaces.Count == 0;
+        if (FocusedAgent is not null && Workspaces.SelectMany(g => g.Agents).All(a => a != FocusedAgent))
+            FocusedAgent = Workspaces.SelectMany(g => g.Agents).FirstOrDefault();
+        UpdateSelectionSummary();
+    }
+
+    private List<AgentRecord> SelectedAgents() =>
+        _allGroups.SelectMany(g => g.Agents).Where(a => a.IsSelected).Select(a => a.Record).ToList();
+
+    private void UpdateSelectionSummary()
+    {
+        var agents = _allGroups.SelectMany(g => g.Agents).Where(a => a.IsSelected).ToList();
+        var workspaces = agents
+            .Select(a => a.Record.WorkspaceId ?? a.Record.WorkspaceLabel)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+        SelectionSummary = agents.Count == 0
+            ? "Nothing selected"
+            : $"{workspaces} workspace{(workspaces == 1 ? "" : "s")} · {agents.Count} agent{(agents.Count == 1 ? "" : "s")}";
+        BackupButtonText = agents.Count == 0
+            ? "Back up selected"
+            : $"Back up {SelectionSummary}";
+    }
+
+    private async Task RunBackupAsync(List<AgentRecord> agents)
+    {
+        var staging = Path.Combine(Path.GetTempPath(), "CursorSync", "pack-" + Guid.NewGuid().ToString("n"));
+        Directory.CreateDirectory(staging);
+
+        try
+        {
+            var result = await ExecuteAsync("Backing up workspaces…", progress =>
+                _transfer.BackupPack(agents, CursorPaths.FromSettings(_host.Settings), staging,
+                    IncludeTranscript, IncludeStore, IncludeWaypoints, progress, CancellationToken.None));
+
+            if (!result.Success)
+            {
+                RecordHistory("Workspace backup", result, PackName(agents));
+                _host.Notify(result.Error ?? "Backup failed.", "error");
+                return;
+            }
+
+            var zipPath = BackupArchive.UniquePath(_store.AgentBackupsFolder, BackupArchive.FileName());
+            result = await ExecuteAsync("Compressing backup…", _ =>
+            {
+                BackupArchive.CompressDirectory(staging, zipPath);
+                return result with { OutputPath = zipPath, BytesCopied = new FileInfo(zipPath).Length };
+            });
+
+            if (!result.Success)
+            {
+                RecordHistory("Workspace backup", result, PackName(agents));
+                _host.Notify(result.Error ?? "Could not compress the backup.", "error");
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(_host.Settings.HubPath))
+            {
+                try
+                {
+                    var hubFolder = Path.Combine(_host.Settings.HubPath, "payload", "agent-transfers");
+                    Directory.CreateDirectory(hubFolder);
+                    var hubFile = Path.Combine(hubFolder, Path.GetFileName(zipPath));
+                    File.Copy(zipPath, hubFile, overwrite: true);
+                    result = result with { OutputPath = hubFile };
+                }
+                catch (Exception ex)
+                {
+                    _host.Notify("Local backup succeeded, but copying to the sync folder failed: " + ex.Message, "warn");
+                }
+            }
+
+            RecordHistory("Workspace backup", result, Path.GetFileNameWithoutExtension(zipPath));
+            _host.Notify($"Backup saved as {Path.GetFileName(zipPath)} · {FileSizeFormatter.FromBytes(result.BytesCopied)}", "success");
+            await RefreshBackupListAsync(zipPath);
+        }
+        finally
+        {
+            BackupArchive.TryDeleteDirectory(staging);
         }
     }
 
-    private async Task RestoreLiveAsync(AgentRecord agent, CursorWorkspaceInfo target)
+    private async Task RestoreBackupAsync(string path, CursorWorkspaceInfo? fallback)
     {
-        var temp = Path.Combine(Path.GetTempPath(), "CursorSync", "agent-" + Guid.NewGuid().ToString("n"));
+        if (!await EnsureCursorClosedForDatabaseAsync())
+            return;
+
+        string? extracted = null;
+        try
+        {
+            var folder = path;
+            if (BackupArchive.IsZip(path))
+            {
+                extracted = BackupArchive.ExtractToTemp(path);
+                folder = extracted;
+            }
+
+            AgentTransferResult? result = null;
+            var guard = await _host.GuardAsync(
+                "Restoring backup",
+                IntegrityPlan.Restore(fallback, 1),
+                async () =>
+                {
+                    result = await ExecuteAsync("Restoring backup…", progress =>
+                        _transfer.RestorePack(folder, _workspaces, fallback, CursorPaths.FromSettings(_host.Settings),
+                            IncludeTranscript, IncludeStore, IncludeWaypoints, ForceRestoreTarget, progress, CancellationToken.None));
+                    return result.Success;
+                });
+            if (!guard.Completed || result is null)
+                return;
+
+            FinishRestore(result, SelectedBackup?.Label ?? Path.GetFileName(path));
+            if (result.Success)
+                await RefreshAsync();
+        }
+        catch (Exception ex)
+        {
+            _host.Notify(UserFacingError.From(ex), "error");
+        }
+        finally
+        {
+            BackupArchive.TryDeleteDirectory(extracted);
+        }
+    }
+
+    private async Task CopyLiveAsync(List<AgentRecord> agents, CursorWorkspaceInfo target)
+    {
+        var temp = Path.Combine(Path.GetTempPath(), "CursorSync", "pack-" + Guid.NewGuid().ToString("n"));
         Directory.CreateDirectory(temp);
         try
         {
             if (!await EnsureCursorClosedForDatabaseAsync())
                 return;
 
-            var backup = await ExecuteAsync("Preparing agent copy…", progress =>
-                _transfer.Backup(agent, CursorPaths.FromSettings(_host.Settings), temp,
+            var backup = await ExecuteAsync("Preparing copies…", progress =>
+                _transfer.BackupPack(agents, CursorPaths.FromSettings(_host.Settings), temp,
                     IncludeTranscript, IncludeStore, IncludeWaypoints, progress, CancellationToken.None));
             if (!backup.Success)
             {
-                _host.Notify(backup.Error ?? "Could not collect the agent data.", "error");
+                _host.Notify(backup.Error ?? "Could not collect the selected agents.", "error");
                 return;
             }
 
-            var restore = await ExecuteAsync("Restoring into the target workspace…", progress =>
-                _transfer.Restore(temp, target, CursorPaths.FromSettings(_host.Settings),
-                    IncludeTranscript, IncludeStore, IncludeWaypoints, progress, CancellationToken.None));
-            FinishRestore(restore, agent.Title);
+            AgentTransferResult? restore = null;
+            var guard = await _host.GuardAsync(
+                "Copying agents",
+                IntegrityPlan.Restore(target, agents.Count),
+                async () =>
+                {
+                    restore = await ExecuteAsync("Copying into the destination workspace…", progress =>
+                        _transfer.RestorePack(temp, _workspaces, target, CursorPaths.FromSettings(_host.Settings),
+                            IncludeTranscript, IncludeStore, IncludeWaypoints, true, progress, CancellationToken.None));
+                    return restore.Success;
+                });
+            if (!guard.Completed || restore is null)
+                return;
+
+            FinishRestore(restore, target.Label);
+            if (restore.Success)
+                await RefreshAsync();
         }
         finally
         {
             try { Directory.Delete(temp, recursive: true); }
-            catch { /* temp cleanup is best-effort */ }
+            catch { /* best-effort */ }
         }
     }
 
-    private async Task RestoreBackupAsync(string folder, CursorWorkspaceInfo target)
+    private async Task AssignLiveAsync(List<AgentRecord> agents, CursorWorkspaceInfo target)
     {
-        if (!await EnsureCursorClosedForDatabaseAsync())
-            return;
+        try
+        {
+            if (!await EnsureCursorClosedForDatabaseAsync())
+                return;
 
-        var result = await ExecuteAsync("Restoring backup…", progress =>
-            _transfer.Restore(folder, target, CursorPaths.FromSettings(_host.Settings),
-                IncludeTranscript, IncludeStore, IncludeWaypoints, progress, CancellationToken.None));
-        FinishRestore(result, SelectedBackup?.Label ?? "Agent");
+            AgentTransferResult? result = null;
+            var guard = await _host.GuardAsync(
+                "Assigning agents",
+                IntegrityPlan.Assign(target, agents.Count),
+                async () =>
+                {
+                    result = await ExecuteAsync("Assigning agents…", progress =>
+                        _transfer.Assign(agents, target, CursorPaths.FromSettings(_host.Settings), progress, CancellationToken.None));
+                    return result.Success;
+                });
+            if (!guard.Completed || result is null)
+                return;
+
+            RecordHistory("Assign agents", result, target.Label);
+            if (result.Success)
+            {
+                var extra = result.Warnings.Count > 0 ? " " + result.Warnings[0] : " Reopen Cursor on the destination folder to see the agents.";
+                _host.Notify($"Assigned {agents.Count} agent{(agents.Count == 1 ? "" : "s")} to “{target.Label}”.{extra}",
+                    result.Warnings.Count > 0 ? "warn" : "success");
+                await RefreshAsync();
+            }
+            else
+            {
+                _host.Notify(result.Error ?? "Could not assign those agents.", "error");
+            }
+        }
+        catch (Exception ex)
+        {
+            _host.Notify(UserFacingError.From(ex), "error");
+        }
+    }
+
+    private async Task DeleteSelectedAsync(List<AgentRecord> agents)
+    {
+        try
+        {
+            if (!await EnsureCursorClosedForDatabaseAsync())
+                return;
+
+            AgentTransferResult? result = null;
+            var guard = await _host.GuardAsync(
+                "Deleting chats",
+                IntegrityPlan.DeleteAgents(agents.Count),
+                async () =>
+                {
+                    result = await ExecuteAsync("Deleting chats…", progress =>
+                        _transfer.Delete(agents, CursorPaths.FromSettings(_host.Settings), progress, CancellationToken.None));
+                    return result.Success;
+                });
+            if (!guard.Completed || result is null)
+                return;
+
+            RecordHistory("Delete chats", result, agents.Count == 1 ? agents[0].Title : $"{agents.Count} chats");
+            if (result.Success)
+            {
+                var extra = result.Warnings.Count > 0 ? " " + result.Warnings[0] : " Reopen Cursor to refresh the Agents list.";
+                _host.Notify($"Deleted {agents.Count} chat{(agents.Count == 1 ? "" : "s")}.{extra}",
+                    result.Warnings.Count > 0 ? "warn" : "success");
+                await RefreshAsync();
+            }
+            else
+            {
+                _host.Notify(result.Error ?? "Could not delete those chats.", "error");
+            }
+        }
+        catch (Exception ex)
+        {
+            _host.Notify(UserFacingError.From(ex), "error");
+        }
     }
 
     private void FinishRestore(AgentTransferResult result, string title)
     {
-        RecordHistory("Agent restore", result, title);
+        RecordHistory("Workspace restore", result, title);
         if (result.Success)
         {
-            var extra = result.Warnings.Count > 0 ? " " + result.Warnings[0] : " Reopen the target folder in Cursor to see it.";
+            var extra = result.Warnings.Count > 0 ? " " + result.Warnings[0] : " Reopen Cursor on the target folder to see the agents.";
             _host.Notify($"Restored “{title}” — {result.FilesCopied} files.{extra}", result.Warnings.Count > 0 ? "warn" : "success");
         }
         else
@@ -319,7 +819,7 @@ public partial class AgentTransferViewModel : ObservableObject
                 return true;
         }
 
-        _host.Notify("Close Cursor first so the chat list can be updated. Transcript and store files can still copy, but the sidebar will not show the agent until the database is writable.", "warn");
+        _host.Notify("Close Cursor first so the chat list can be updated. Files can still copy, but new agents may stay hidden until the database is writable.", "warn");
         return true;
     }
 
@@ -331,13 +831,13 @@ public partial class AgentTransferViewModel : ObservableObject
             var progress = new Progress<SyncProgress>(p =>
             {
                 if (!string.IsNullOrWhiteSpace(p.Message))
-                    _host.BeginBackgroundWork(p.Message);
+                    _host.SetBusyStatus(p.Message);
             });
             return await Task.Run(() => work(progress));
         }
         catch (Exception ex)
         {
-            return new AgentTransferResult { Success = false, Error = ex.Message };
+            return new AgentTransferResult { Success = false, Error = UserFacingError.From(ex) };
         }
         finally
         {
@@ -369,45 +869,13 @@ public partial class AgentTransferViewModel : ObservableObject
             yield return Path.Combine(settings.HubPath, "payload", "agent-transfers");
     }
 
-    private void ApplyAgentFilter()
+    private static string PackName(IReadOnlyList<AgentRecord> agents)
     {
-        var query = SearchText?.Trim() ?? "";
-        var workspaceId = SelectedWorkspaceFilter?.Id ?? "";
-        var filtered = _agents.AsEnumerable();
-        if (!string.IsNullOrWhiteSpace(workspaceId))
-            filtered = filtered.Where(a => a.WorkspaceId == workspaceId);
-        if (query.Length > 0)
-        {
-            filtered = filtered.Where(a =>
-                a.Title.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                (a.WorkspaceLabel?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false) ||
-                a.ComposerId.Contains(query, StringComparison.OrdinalIgnoreCase));
-        }
-
-        Agents.Clear();
-        foreach (var agent in filtered)
-            Agents.Add(new AgentItemViewModel(agent));
-        ShowEmptyAgents = Agents.Count == 0;
-    }
-
-    private static string SafeName(string title)
-    {
-        var trimmed = new string(title.Take(40).ToArray()).Trim();
-        foreach (var c in Path.GetInvalidFileNameChars())
-            trimmed = trimmed.Replace(c, '-');
-        return string.IsNullOrWhiteSpace(trimmed) ? "agent" : trimmed;
-    }
-
-    private static void CopyDirectory(string source, string destination)
-    {
-        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
-        {
-            var dest = Path.Combine(destination, Path.GetRelativePath(source, file));
-            var dir = Path.GetDirectoryName(dest);
-            if (!string.IsNullOrEmpty(dir))
-                Directory.CreateDirectory(dir);
-            File.Copy(file, dest, overwrite: true);
-        }
+        var names = agents
+            .Select(a => a.WorkspaceLabel ?? "workspace")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        return names.Count == 1 ? names[0] : $"{names.Count}-workspaces";
     }
 }
 
@@ -417,26 +885,114 @@ public sealed class WorkspaceOption
     public required string Label { get; init; }
     public required string FolderPath { get; init; }
     public CursorWorkspaceInfo? Info { get; init; }
+
+    public override string ToString() => Label;
 }
 
-public sealed class AgentItemViewModel
+public partial class WorkspaceGroupViewModel : ObservableObject
 {
-    public AgentItemViewModel(AgentRecord record)
+    private readonly Action _changed;
+    private bool _suppress;
+
+    public WorkspaceGroupViewModel(CursorWorkspaceInfo? info, string label, string folderPath, Action changed)
+    {
+        Info = info;
+        Label = label;
+        FolderPath = folderPath;
+        _changed = changed;
+    }
+
+    public CursorWorkspaceInfo? Info { get; }
+    public string Label { get; }
+    public string FolderPath { get; }
+    public ObservableCollection<AgentItemViewModel> Agents { get; } = [];
+
+    [ObservableProperty] private bool? _isChecked = false;
+    [ObservableProperty] private bool _isVisible = true;
+    [ObservableProperty] private string _countText = "0 agents";
+
+    public IEnumerable<AgentItemViewModel> VisibleAgents => Agents.Where(a => a.IsVisible);
+
+    partial void OnIsCheckedChanged(bool? value)
+    {
+        if (_suppress)
+            return;
+
+        var selected = value != false;
+        if (value is null)
+        {
+            _suppress = true;
+            IsChecked = false;
+            _suppress = false;
+            selected = false;
+        }
+
+        foreach (var agent in Agents.Where(a => a.IsVisible))
+            agent.SetSelected(selected);
+        _changed();
+    }
+
+    public void SetChecked(bool value)
+    {
+        _suppress = true;
+        IsChecked = value;
+        _suppress = false;
+        foreach (var agent in Agents.Where(a => a.IsVisible))
+            agent.SetSelected(value);
+    }
+
+    public void NotifyHost() => _changed();
+
+    public void RefreshState()
+    {
+        var visible = Agents.Where(a => a.IsVisible).ToList();
+        _suppress = true;
+        if (visible.Count == 0 || visible.All(a => !a.IsSelected))
+            IsChecked = false;
+        else if (visible.All(a => a.IsSelected))
+            IsChecked = true;
+        else
+            IsChecked = null;
+        _suppress = false;
+        CountText = $"{visible.Count} agent{(visible.Count == 1 ? "" : "s")}";
+        IsVisible = visible.Count > 0;
+    }
+
+    public void ApplyFilter(string query)
+    {
+        foreach (var agent in Agents)
+        {
+            agent.IsVisible = query.Length == 0
+                || agent.Title.Contains(query, StringComparison.OrdinalIgnoreCase)
+                || Label.Contains(query, StringComparison.OrdinalIgnoreCase)
+                || FolderPath.Contains(query, StringComparison.OrdinalIgnoreCase);
+        }
+        RefreshState();
+    }
+}
+
+public partial class AgentItemViewModel : ObservableObject
+{
+    private readonly WorkspaceGroupViewModel _group;
+
+    public AgentItemViewModel(AgentRecord record, WorkspaceGroupViewModel group)
     {
         Record = record;
+        _group = group;
         Id = record.ComposerId;
         Title = record.Title;
         WorkspaceLabel = record.WorkspaceLabel ?? "Unknown workspace";
-        Detail = $"{record.LastWriteUtc.ToLocalTime():g} · {FileSizeFormatter.FromBytes(record.Bytes)} · {record.Files} files";
+        Detail = $"{record.LastWriteUtc.ToLocalTime():g} · {FileSizeFormatter.FromBytes(record.Bytes)}";
         Meta = record.HasStore || record.HasWaypoints
             ? string.Join(" · ", new[]
             {
                 record.HasStore ? "Store" : null,
                 record.HasWaypoints ? $"{record.WaypointDirs.Count} waypoint{(record.WaypointDirs.Count == 1 ? "" : "s")}" : null
             }.Where(s => s is not null))
-            : "Transcript only";
+            : "Transcript";
         HasStore = record.HasStore;
         HasWaypoints = record.HasWaypoints;
+        IsVisible = true;
     }
 
     public AgentRecord Record { get; }
@@ -447,4 +1003,21 @@ public sealed class AgentItemViewModel
     public string Meta { get; }
     public bool HasStore { get; }
     public bool HasWaypoints { get; }
+
+    [ObservableProperty] private bool _isSelected;
+    [ObservableProperty] private bool _isVisible;
+    [ObservableProperty] private bool _isPreviewing;
+
+    partial void OnIsSelectedChanged(bool value)
+    {
+        _group.RefreshState();
+        _group.NotifyHost();
+    }
+
+    public void SetSelected(bool value)
+    {
+        if (IsSelected == value)
+            return;
+        IsSelected = value;
+    }
 }

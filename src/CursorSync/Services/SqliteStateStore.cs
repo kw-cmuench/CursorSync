@@ -84,6 +84,197 @@ public static class SqliteStateStore
         workspaceTx.Commit();
     }
 
+    public static void RetargetComposer(
+        CursorPaths paths,
+        AgentRecord agent,
+        CursorWorkspaceInfo target,
+        string? headerJson,
+        CancellationToken cancellationToken)
+    {
+        using var global = OpenWritable(paths.StateDb)
+            ?? throw new InvalidOperationException("Could not open Cursor's global chat database. Close Cursor and try again.");
+
+        cancellationToken.ThrowIfCancellationRequested();
+        using var tx = global.BeginTransaction();
+        UpsertComposerHeader(global, tx, target, agent.ComposerId, agent.Title, headerJson ?? agent.HeaderJson);
+        tx.Commit();
+
+        if (!string.IsNullOrWhiteSpace(agent.WorkspaceId)
+            && !string.Equals(agent.WorkspaceId, target.Id, StringComparison.OrdinalIgnoreCase))
+        {
+            var sourceDb = Path.Combine(paths.WorkspaceStorage, agent.WorkspaceId, "state.vscdb");
+            if (File.Exists(sourceDb))
+            {
+                using var source = OpenWritable(sourceDb);
+                if (source is not null)
+                {
+                    using var sourceTx = source.BeginTransaction();
+                    RemoveSelectedComposer(source, sourceTx, agent.ComposerId);
+                    sourceTx.Commit();
+                }
+            }
+        }
+
+        var destDb = Path.Combine(target.StorageDir, "state.vscdb");
+        if (!File.Exists(destDb))
+            return;
+
+        using var dest = OpenWritable(destDb);
+        if (dest is null)
+            return;
+
+        using var destTx = dest.BeginTransaction();
+        AddSelectedComposer(dest, destTx, agent.ComposerId);
+        destTx.Commit();
+    }
+
+    public static void DetachComposers(CursorPaths paths, IReadOnlyList<string> composerIds, CancellationToken cancellationToken)
+    {
+        var ids = composerIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (ids.Count == 0)
+            return;
+
+        using var global = OpenWritable(paths.StateDb)
+            ?? throw new InvalidOperationException("Could not open Cursor's global chat database. Close Cursor and try again.");
+
+        cancellationToken.ThrowIfCancellationRequested();
+        using var tx = global.BeginTransaction();
+        var json = ReadItem(global, "composer.composerHeaders", tx);
+        if (string.IsNullOrWhiteSpace(json))
+            return;
+
+        JsonObject root;
+        try
+        {
+            root = JsonNode.Parse(json) as JsonObject ?? new JsonObject();
+        }
+        catch
+        {
+            return;
+        }
+
+        if (root["allComposers"] is not JsonArray composers)
+            return;
+
+        var changed = false;
+        foreach (var node in composers.OfType<JsonObject>())
+        {
+            var id = node["composerId"]?.GetValue<string>();
+            if (id is null || !ids.Contains(id))
+                continue;
+            if (node.Remove("workspaceIdentifier"))
+                changed = true;
+        }
+
+        if (changed)
+            Upsert(global, tx, "ItemTable", "composer.composerHeaders", root.ToJsonString());
+        tx.Commit();
+    }
+
+    public static void DeleteComposers(
+        CursorPaths paths,
+        IReadOnlyList<AgentRecord> agents,
+        CancellationToken cancellationToken)
+    {
+        var ids = agents
+            .Select(agent => agent.ComposerId)
+            .Where(id => !string.IsNullOrWhiteSpace(id) && AgentCatalog.IsComposerId(id))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (ids.Count == 0)
+            return;
+
+        using var global = OpenWritable(paths.StateDb)
+            ?? throw new InvalidOperationException("Could not open Cursor's global chat database. Close Cursor and try again.");
+
+        cancellationToken.ThrowIfCancellationRequested();
+        using (var tx = global.BeginTransaction())
+        {
+            RemoveComposerHeaders(global, tx, ids);
+            DeleteComposerKeys(global, tx, ids);
+            tx.Commit();
+        }
+
+        var storageDirs = agents
+            .Select(agent => agent.WorkspaceId)
+            .Where(id => !string.IsNullOrWhiteSpace(id) && id is not "." and not "..")
+            .Where(id => id!.IndexOfAny(Path.GetInvalidFileNameChars()) < 0)
+            .Select(id => Path.Combine(paths.WorkspaceStorage, id!))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var dir in storageDirs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var db = Path.Combine(dir, "state.vscdb");
+            if (!File.Exists(db))
+                continue;
+
+            using var workspace = OpenWritable(db);
+            if (workspace is null)
+                continue;
+
+            using var workspaceTx = workspace.BeginTransaction();
+            foreach (var id in ids)
+                RemoveSelectedComposer(workspace, workspaceTx, id);
+            workspaceTx.Commit();
+        }
+    }
+
+    private static void RemoveComposerHeaders(SqliteConnection connection, SqliteTransaction tx, HashSet<string> ids)
+    {
+        var json = ReadItem(connection, "composer.composerHeaders", tx);
+        if (string.IsNullOrWhiteSpace(json))
+            return;
+
+        JsonObject root;
+        try
+        {
+            root = JsonNode.Parse(json) as JsonObject ?? new JsonObject();
+        }
+        catch
+        {
+            return;
+        }
+
+        if (root["allComposers"] is not JsonArray composers)
+            return;
+
+        var changed = false;
+        for (var i = composers.Count - 1; i >= 0; i--)
+        {
+            var id = composers[i]?["composerId"]?.GetValue<string>();
+            if (id is null || !ids.Contains(id))
+                continue;
+            composers.RemoveAt(i);
+            changed = true;
+        }
+
+        if (changed)
+            Upsert(connection, tx, "ItemTable", "composer.composerHeaders", root.ToJsonString());
+    }
+
+    private static void DeleteComposerKeys(SqliteConnection connection, SqliteTransaction tx, IEnumerable<string> ids)
+    {
+        foreach (var id in ids)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = """
+                DELETE FROM cursorDiskKV
+                WHERE key = $exact
+                   OR key LIKE $prefix1
+                   OR key LIKE $prefix2
+                   OR key LIKE $prefix3
+                """;
+            cmd.Parameters.AddWithValue("$exact", $"composerData:{id}");
+            cmd.Parameters.AddWithValue("$prefix1", $"bubbleId:{id}:%");
+            cmd.Parameters.AddWithValue("$prefix2", $"checkpointId:{id}:%");
+            cmd.Parameters.AddWithValue("$prefix3", $"messageRequestContext:{id}:%");
+            cmd.ExecuteNonQuery();
+        }
+    }
+
     private static Dictionary<string, (string Title, string? WorkspaceId, string? WorkspacePath, string HeaderJson)> ReadHeaders(SqliteConnection connection)
     {
         var map = new Dictionary<string, (string Title, string? WorkspaceId, string? WorkspacePath, string HeaderJson)>(StringComparer.OrdinalIgnoreCase);
@@ -237,7 +428,9 @@ public static class SqliteStateStore
             {
                 ["fsPath"] = target.FolderPath,
                 ["scheme"] = "file",
-                ["external"] = target.FolderUri
+                ["external"] = string.IsNullOrWhiteSpace(target.FolderUri)
+                    ? CursorWorkspaceLocator.ToFileUri(target.FolderPath)
+                    : target.FolderUri
             }
         };
         composers.Add(header);
@@ -268,6 +461,34 @@ public static class SqliteStateStore
             selected.Add(composerId);
 
         root["hasMigratedComposerData"] = true;
+        Upsert(connection, tx, "ItemTable", "composer.composerData", root.ToJsonString());
+    }
+
+    private static void RemoveSelectedComposer(SqliteConnection connection, SqliteTransaction tx, string composerId)
+    {
+        var json = ReadItem(connection, "composer.composerData", tx);
+        if (string.IsNullOrWhiteSpace(json))
+            return;
+
+        JsonObject root;
+        try
+        {
+            root = JsonNode.Parse(json) as JsonObject ?? new JsonObject();
+        }
+        catch
+        {
+            return;
+        }
+
+        if (root["selectedComposerIds"] is not JsonArray selected)
+            return;
+
+        for (var i = selected.Count - 1; i >= 0; i--)
+        {
+            if (string.Equals(selected[i]?.GetValue<string>(), composerId, StringComparison.OrdinalIgnoreCase))
+                selected.RemoveAt(i);
+        }
+
         Upsert(connection, tx, "ItemTable", "composer.composerData", root.ToJsonString());
     }
 
@@ -323,6 +544,11 @@ public static class SqliteStateStore
         }
     }
 
+    public static void PrepareForWrite()
+    {
+        SqliteConnection.ClearAllPools();
+    }
+
     private static SqliteConnection? OpenSnapshot(string dbPath)
     {
         if (!File.Exists(dbPath))
@@ -330,7 +556,7 @@ public static class SqliteStateStore
 
         try
         {
-            return Open($"Data Source={dbPath};Mode=ReadOnly;Cache=Shared");
+            return Open($"Data Source={dbPath};Mode=ReadOnly;Pooling=False", writable: false);
         }
         catch
         {
@@ -342,16 +568,43 @@ public static class SqliteStateStore
     {
         if (!File.Exists(dbPath))
             return null;
-        return Open($"Data Source={dbPath};Cache=Shared");
+
+        ClearReadOnlySidecars(dbPath);
+        SqliteConnection.ClearAllPools();
+        return Open($"Data Source={dbPath};Mode=ReadWrite;Pooling=False", writable: true);
     }
 
-    private static SqliteConnection? Open(string connectionString)
+    private static void ClearReadOnlySidecars(string dbPath)
+    {
+        foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+        {
+            if (!File.Exists(path))
+                continue;
+            try
+            {
+                var attrs = File.GetAttributes(path);
+                if ((attrs & FileAttributes.ReadOnly) != 0)
+                    File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
+            }
+            catch
+            {
+                // opening for write will surface a clearer error
+            }
+        }
+    }
+
+    private static SqliteConnection Open(string connectionString, bool writable)
     {
         var connection = new SqliteConnection(connectionString);
         connection.Open();
-        using var pragma = connection.CreateCommand();
-        pragma.CommandText = "PRAGMA busy_timeout=8000;";
-        pragma.ExecuteNonQuery();
+        using (var pragma = connection.CreateCommand())
+        {
+            pragma.CommandText = writable
+                ? "PRAGMA busy_timeout=15000; PRAGMA query_only=0;"
+                : "PRAGMA busy_timeout=8000;";
+            pragma.ExecuteNonQuery();
+        }
+
         return connection;
     }
 }

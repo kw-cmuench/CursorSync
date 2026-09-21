@@ -4,6 +4,8 @@ public enum AppPage
 {
     Dashboard,
     Categories,
+    Workspaces,
+    Projects,
     Agents,
     Sync,
     History,
@@ -22,6 +24,13 @@ public enum ConflictPolicy
     NewerWins,
     PreferLocal,
     PreferHub
+}
+
+public enum CursorRisk
+{
+    None,
+    Medium,
+    High
 }
 
 public enum CategoryGroup

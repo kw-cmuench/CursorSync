@@ -3,9 +3,11 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="0,0,12,24">
         <StackPanel>
-            <TextBlock Text="Settings" Style="{StaticResource TitleText}"/>
-            <TextBlock Margin="0,6,0,18" Style="{StaticResource MutedText}"
-                       Text="Point both machines at the same folder. Cursor account login stays in Cursor — this app only copies local data."/>
+            <StackPanel Style="{StaticResource PageHeader}">
+                <TextBlock Text="Settings" Style="{StaticResource TitleText}"/>
+                <TextBlock Style="{StaticResource PageLead}"
+                           Text="Point both machines at the same folder. Cursor account login stays in Cursor — this app only copies local data."/>
+            </StackPanel>
 
             <Border Style="{StaticResource Card}" Margin="0,0,0,12">
                 <StackPanel>
@@ -21,8 +23,21 @@
                         <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="8,0,0,0">
                             <Button Content="Browse" Style="{StaticResource GhostButton}" Command="{Binding BrowseHubCommand}"/>
                             <Button Content="Open" Style="{StaticResource GhostButton}" Margin="8,0,0,0" Command="{Binding OpenHubCommand}"/>
+                            <Button Content="Check health" Style="{StaticResource GhostButton}" Margin="8,0,0,0" Command="{Binding CheckHubHealthCommand}"/>
                         </StackPanel>
                     </Grid>
+                    <Button Content="Empty sync folder" Style="{StaticResource DangerButton}" Margin="0,12,0,0"
+                            HorizontalAlignment="Left" Command="{Binding EmptyHubCommand}"/>
+                    <TextBlock Text="{Binding HubHealthSummary}" FontWeight="SemiBold" Margin="0,12,0,0" TextWrapping="Wrap"/>
+                    <TextBlock Text="{Binding HubHealthDetail}" Style="{StaticResource CaptionText}" Margin="0,4,0,0"/>
+                    <ItemsControl ItemsSource="{Binding HubHealthIssues}" Margin="0,8,0,0"
+                                  Visibility="{Binding HasHubHealthIssues, Converter={StaticResource BoolToVis}}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding Display}" Style="{StaticResource MutedText}" Margin="0,0,0,6"/>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
                     <TextBlock Text="Suggestions" Style="{StaticResource CaptionText}" Margin="0,14,0,8"/>
                     <ItemsControl ItemsSource="{Binding SuggestedHubs}">
                         <ItemsControl.ItemsPanel>
@@ -72,7 +87,14 @@
                               IsChecked="{Binding BackupBeforePull, Mode=TwoWay}" Content="Backup selected local data before pull"/>
                     <CheckBox Style="{StaticResource ToggleSwitch}" Margin="0,14,0,0"
                               IsChecked="{Binding CloseCursorBeforeSync, Mode=TwoWay}" Content="Try to close Cursor before syncing locked databases"/>
-                    <Button Content="Open backups folder" Style="{StaticResource GhostButton}" Margin="0,16,0,0" HorizontalAlignment="Left" Command="{Binding OpenBackupsCommand}"/>
+                    <CheckBox Style="{StaticResource ToggleSwitch}" Margin="0,14,0,0"
+                              IsChecked="{Binding ProtectCursorData, Mode=TwoWay}"
+                              Content="Snapshot Cursor data before risky changes and restore it if a health check fails"/>
+                    <TextBlock Style="{StaticResource CaptionText}" Margin="0,8,0,0"
+                               Text="Covers workspace edit, split follow-up, merge, delete, agent assign/restore/copy, and pull/two-way sync. The snapshot is deleted when the check still looks consistent."/>
+                    <Button Content="Check Cursor data now" Style="{StaticResource GhostButton}" Margin="0,16,0,0" HorizontalAlignment="Left"
+                            Command="{Binding CheckCursorDataCommand}"/>
+                    <Button Content="Open backups folder" Style="{StaticResource GhostButton}" Margin="0,8,0,0" HorizontalAlignment="Left" Command="{Binding OpenBackupsCommand}"/>
                 </StackPanel>
             </Border>
 

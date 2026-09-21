@@ -31,9 +31,12 @@ public sealed class BoolToVisibilityConverter : IValueConverter
 
 public sealed class NullOrEmptyToVisibilityConverter : IValueConverter
 {
+    public bool Invert { get; set; }
+
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
     {
         var empty = value is null || value is string s && string.IsNullOrWhiteSpace(s);
+        if (Invert) empty = !empty;
         return empty ? Visibility.Collapsed : Visibility.Visible;
     }
 
