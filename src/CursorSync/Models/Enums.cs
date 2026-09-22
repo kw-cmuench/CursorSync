@@ -40,3 +40,10 @@ public enum CategoryGroup
     Editor,
     Optional
 }
+
+public enum AgentListFilter
+{
+    Active,
+    Archived,
+    All
+}

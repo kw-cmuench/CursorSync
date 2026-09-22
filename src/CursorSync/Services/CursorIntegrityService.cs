@@ -133,6 +133,9 @@ public static class CursorIntegrityService
         if (plan.Action == "delete-agents" && plan.AgentCount <= 0)
             issues.Add(Error("predict.deleteAgents", "No chat was selected to delete."));
 
+        if (plan.Action == "archive-agents" && plan.AgentCount <= 0)
+            issues.Add(Error("predict.archiveAgents", "No chat was selected to archive or restore."));
+
         if (plan.Action == "rename-project")
         {
             if (string.IsNullOrWhiteSpace(plan.NewFolder))

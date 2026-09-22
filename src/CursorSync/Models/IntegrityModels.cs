@@ -130,6 +130,14 @@ public sealed class IntegrityPlan
         AgentCount = agentCount
     };
 
+    public static IntegrityPlan ArchiveAgents(int agentCount) => new()
+    {
+        Action = "archive-agents",
+        TouchesSqlite = true,
+        TouchesWorkspaceStorage = true,
+        AgentCount = agentCount
+    };
+
     public static IntegrityPlan DeleteProjects(int projectCount, int agentCount) => new()
     {
         Action = "delete-projects",

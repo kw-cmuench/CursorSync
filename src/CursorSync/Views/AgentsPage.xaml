@@ -36,7 +36,7 @@
                 <Button Content="Open backups" Style="{StaticResource GhostButton}" Margin="8,0,0,0" Command="{Binding Agents.OpenBackupFolderCommand}"/>
             </StackPanel>
             <TextBlock Grid.Row="1" Style="{StaticResource PageLead}"
-                       Text="Back up agents, restore CursorSync packs, or import an older zip / a folder you copied yourself. Imports are integrity-checked before anything is written."/>
+                       Text="Back up, restore, or import agents. Switch to Archived to restore chats Cursor has hidden from the Agents window, or archive chats from here."/>
         </Grid>
 
         <Grid Grid.Row="1" Margin="0,0,12,8">
@@ -61,7 +61,24 @@
                         <RowDefinition Height="8"/>
                         <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
-                    <TextBlock Text="Workspaces on this PC" Style="{StaticResource CaptionText}"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Workspaces on this PC" Style="{StaticResource CaptionText}" VerticalAlignment="Center"/>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal">
+                            <RadioButton GroupName="AgentListFilter" Margin="0,0,12,0" Foreground="{StaticResource TextBrush}"
+                                         IsChecked="{Binding Agents.ListFilter, Converter={StaticResource EnumEquals}, ConverterParameter=Active, Mode=TwoWay}"
+                                         Content="Active"/>
+                            <RadioButton GroupName="AgentListFilter" Margin="0,0,12,0" Foreground="{StaticResource TextBrush}"
+                                         IsChecked="{Binding Agents.ListFilter, Converter={StaticResource EnumEquals}, ConverterParameter=Archived, Mode=TwoWay}"
+                                         Content="Archived"/>
+                            <RadioButton GroupName="AgentListFilter" Foreground="{StaticResource TextBrush}"
+                                         IsChecked="{Binding Agents.ListFilter, Converter={StaticResource EnumEquals}, ConverterParameter=All, Mode=TwoWay}"
+                                         Content="All"/>
+                        </StackPanel>
+                    </Grid>
                     <Grid Grid.Row="2">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*"/>
@@ -148,6 +165,10 @@
                     <TextBlock Text="{Binding Agents.SelectionSummary}" Style="{StaticResource CaptionText}" Margin="0,0,0,8"/>
                     <Button Content="{Binding Agents.BackupButtonText}" Style="{StaticResource PrimaryButton}"
                             Command="{Binding Agents.BackupSelectedCommand}"/>
+                    <Button Content="Archive checked chats" Style="{StaticResource GhostButton}" Margin="0,8,0,0"
+                            Command="{Binding Agents.ArchiveSelectedAgentsCommand}"/>
+                    <Button Content="Restore archived chats" Style="{StaticResource GhostButton}" Margin="0,8,0,0"
+                            Command="{Binding Agents.UnarchiveSelectedAgentsCommand}"/>
                     <Button Content="Delete checked chats" Style="{StaticResource DangerButton}" Margin="0,8,0,0"
                             Command="{Binding Agents.DeleteSelectedAgentsCommand}"/>
                 </StackPanel>
@@ -281,6 +302,10 @@
                                 Command="{Binding Agents.CopySelectedToWorkspaceCommand}"/>
                         <Button Content="Assign checked agents to destination" Style="{StaticResource GhostButton}" Margin="0,8,0,0"
                                 Command="{Binding Agents.AssignSelectedToWorkspaceCommand}"/>
+                        <Button Content="Archive checked chats" Style="{StaticResource GhostButton}" Margin="0,8,0,0"
+                                Command="{Binding Agents.ArchiveSelectedAgentsCommand}"/>
+                        <Button Content="Restore archived chats" Style="{StaticResource GhostButton}" Margin="0,8,0,0"
+                                Command="{Binding Agents.UnarchiveSelectedAgentsCommand}"/>
                         <Button Content="Delete checked chats" Style="{StaticResource DangerButton}" Margin="0,8,0,0"
                                 Command="{Binding Agents.DeleteSelectedAgentsCommand}"/>
                     </StackPanel>

@@ -582,6 +582,47 @@ public sealed class AgentTransferService
         };
     }
 
+    public AgentTransferResult SetArchived(
+        IReadOnlyList<AgentRecord> agents,
+        CursorPaths paths,
+        bool archived,
+        IProgress<SyncProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        var selected = agents
+            .Where(agent => AgentCatalog.IsComposerId(agent.ComposerId))
+            .GroupBy(agent => agent.ComposerId, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
+        if (selected.Count == 0)
+            return Fail(archived ? "Check one or more chats to archive." : "Check one or more chats to restore from the archive.");
+
+        var log = new List<string>();
+        try
+        {
+            progress.Report(new SyncProgress
+            {
+                Message = archived ? "Archiving chats…" : "Restoring archived chats…"
+            });
+            SqliteStateStore.SetArchived(paths, selected, archived, cancellationToken);
+            log.Add(archived
+                ? $"Marked {selected.Count} chat{(selected.Count == 1 ? "" : "s")} as archived in Cursor’s chat list."
+                : $"Restored {selected.Count} chat{(selected.Count == 1 ? "" : "s")} to Cursor’s Agents list.");
+        }
+        catch (Exception ex)
+        {
+            return Fail("The chats could not be updated in Cursor’s database: " + UserFacingError.From(ex));
+        }
+
+        return new AgentTransferResult
+        {
+            Success = true,
+            FilesCopied = selected.Count,
+            Warnings = [],
+            Log = log
+        };
+    }
+
     private static bool TryDeleteUnder(
         string root,
         string? path,

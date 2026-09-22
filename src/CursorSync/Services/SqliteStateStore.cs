@@ -173,6 +173,86 @@ public static class SqliteStateStore
         tx.Commit();
     }
 
+    public static void SetArchived(
+        CursorPaths paths,
+        IReadOnlyList<AgentRecord> agents,
+        bool archived,
+        CancellationToken cancellationToken)
+    {
+        var ids = agents
+            .Select(agent => agent.ComposerId)
+            .Where(id => !string.IsNullOrWhiteSpace(id) && AgentCatalog.IsComposerId(id))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (ids.Count == 0)
+            return;
+
+        using var global = OpenWritable(paths.StateDb)
+            ?? throw new InvalidOperationException("Could not open Cursor's global chat database. Close Cursor and try again.");
+
+        cancellationToken.ThrowIfCancellationRequested();
+        using (var tx = global.BeginTransaction())
+        {
+            var json = ReadItem(global, "composer.composerHeaders", tx);
+            if (!string.IsNullOrWhiteSpace(json))
+            {
+                JsonObject? root = null;
+                try
+                {
+                    root = JsonNode.Parse(json) as JsonObject;
+                }
+                catch
+                {
+                    root = null;
+                }
+
+                if (root is not null && ApplyArchivedFlags(root, ids, archived))
+                    Upsert(global, tx, "ItemTable", "composer.composerHeaders", root.ToJsonString());
+            }
+
+            TrySetComposerHeadersTable(global, tx, ids, archived);
+            tx.Commit();
+        }
+
+        var storageDirs = agents
+            .Select(agent => agent.WorkspaceId)
+            .Where(id => !string.IsNullOrWhiteSpace(id) && id is not "." and not "..")
+            .Where(id => id!.IndexOfAny(Path.GetInvalidFileNameChars()) < 0)
+            .Select(id => Path.Combine(paths.WorkspaceStorage, id!))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var dir in storageDirs)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var db = Path.Combine(dir, "state.vscdb");
+            if (!File.Exists(db))
+                continue;
+
+            using var workspace = OpenWritable(db);
+            if (workspace is null)
+                continue;
+
+            using var workspaceTx = workspace.BeginTransaction();
+            var workspaceJson = ReadItem(workspace, "composer.composerData", workspaceTx);
+            if (!string.IsNullOrWhiteSpace(workspaceJson))
+            {
+                JsonObject? root = null;
+                try
+                {
+                    root = JsonNode.Parse(workspaceJson) as JsonObject;
+                }
+                catch
+                {
+                    root = null;
+                }
+
+                if (root is not null && ApplyArchivedFlags(root, ids, archived))
+                    Upsert(workspace, workspaceTx, "ItemTable", "composer.composerData", root.ToJsonString());
+            }
+
+            workspaceTx.Commit();
+        }
+    }
+
     public static void DeleteComposers(
         CursorPaths paths,
         IReadOnlyList<AgentRecord> agents,
@@ -237,21 +317,25 @@ public static class SqliteStateStore
             return;
         }
 
-        if (root["allComposers"] is not JsonArray composers)
-            return;
-
         var changed = false;
-        for (var i = composers.Count - 1; i >= 0; i--)
+        foreach (var name in new[] { "allComposers", "archivedComposers" })
         {
-            var id = composers[i]?["composerId"]?.GetValue<string>();
-            if (id is null || !ids.Contains(id))
+            if (root[name] is not JsonArray composers)
                 continue;
-            composers.RemoveAt(i);
-            changed = true;
+            for (var i = composers.Count - 1; i >= 0; i--)
+            {
+                var id = composers[i]?["composerId"]?.GetValue<string>();
+                if (id is null || !ids.Contains(id))
+                    continue;
+                composers.RemoveAt(i);
+                changed = true;
+            }
         }
 
         if (changed)
             Upsert(connection, tx, "ItemTable", "composer.composerHeaders", root.ToJsonString());
+
+        TryDeleteComposerHeadersTable(connection, tx, ids);
     }
 
     private static void DeleteComposerKeys(SqliteConnection connection, SqliteTransaction tx, IEnumerable<string> ids)
@@ -279,40 +363,53 @@ public static class SqliteStateStore
     {
         var map = new Dictionary<string, (string Title, string? WorkspaceId, string? WorkspacePath, string HeaderJson)>(StringComparer.OrdinalIgnoreCase);
         var json = ReadItem(connection, "composer.composerHeaders");
-        if (string.IsNullOrWhiteSpace(json))
-            return map;
-
-        try
+        if (!string.IsNullOrWhiteSpace(json))
         {
-            var root = JsonNode.Parse(json) as JsonObject;
-            if (root?["allComposers"] is not JsonArray composers)
-                return map;
-
-            foreach (var node in composers.OfType<JsonObject>())
+            try
             {
-                var id = node["composerId"]?.GetValue<string>();
-                if (string.IsNullOrWhiteSpace(id))
-                    continue;
-
-                var title = node["name"]?.GetValue<string>() ?? "Untitled agent";
-                string? workspaceId = null;
-                string? workspacePath = null;
-                if (node["workspaceIdentifier"] is JsonObject ident)
-                {
-                    workspaceId = ident["id"]?.GetValue<string>();
-                    workspacePath = ident["uri"]?["fsPath"]?.GetValue<string>()
-                        ?? CursorWorkspaceLocator.TryFolderPath(ident["uri"]?["external"]?.GetValue<string>() ?? "");
-                }
-
-                map[id] = (title, workspaceId, workspacePath, node.ToJsonString());
+                var root = JsonNode.Parse(json) as JsonObject;
+                AddHeaderArray(map, root?["allComposers"] as JsonArray, forceArchived: false);
+                AddHeaderArray(map, root?["archivedComposers"] as JsonArray, forceArchived: true);
+            }
+            catch
+            {
+                // keep whatever headers parsed
             }
         }
-        catch
-        {
-            return map;
-        }
 
+        TryMergeComposerHeadersTable(connection, map);
         return map;
+    }
+
+    private static void AddHeaderArray(
+        Dictionary<string, (string Title, string? WorkspaceId, string? WorkspacePath, string HeaderJson)> map,
+        JsonArray? composers,
+        bool forceArchived)
+    {
+        if (composers is null)
+            return;
+
+        foreach (var node in composers.OfType<JsonObject>())
+        {
+            var id = node["composerId"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(id))
+                continue;
+
+            if (forceArchived)
+                node["isArchived"] = true;
+
+            var title = node["name"]?.GetValue<string>() ?? "Untitled agent";
+            string? workspaceId = null;
+            string? workspacePath = null;
+            if (node["workspaceIdentifier"] is JsonObject ident)
+            {
+                workspaceId = ident["id"]?.GetValue<string>();
+                workspacePath = ident["uri"]?["fsPath"]?.GetValue<string>()
+                    ?? CursorWorkspaceLocator.TryFolderPath(ident["uri"]?["external"]?.GetValue<string>() ?? "");
+            }
+
+            map[id] = (title, workspaceId, workspacePath, node.ToJsonString());
+        }
     }
 
     private static void CaptureKeyedRows(SqliteConnection connection, string table, string composerId, Dictionary<string, string> target)
@@ -371,11 +468,7 @@ public static class SqliteStateStore
         try
         {
             var root = JsonNode.Parse(json) as JsonObject;
-            if (root?["allComposers"] is not JsonArray composers)
-                return;
-
-            var match = composers.OfType<JsonObject>()
-                .FirstOrDefault(n => string.Equals(n["composerId"]?.GetValue<string>(), composerId, StringComparison.OrdinalIgnoreCase));
+            var match = FindComposer(root, composerId);
             if (match is not null)
                 itemTable["composerHeader"] = match.ToJsonString();
         }
@@ -607,4 +700,235 @@ public static class SqliteStateStore
 
         return connection;
     }
+
+    private static bool ApplyArchivedFlags(JsonObject root, HashSet<string> ids, bool archived)
+    {
+        if (root["allComposers"] is not JsonArray && root["archivedComposers"] is not JsonArray)
+            return false;
+
+        var changed = false;
+        foreach (var id in ids)
+        {
+            var node = FindComposer(root, id);
+            if (node is null)
+                continue;
+
+            if (ReadBool(node, "isArchived") != archived)
+            {
+                node["isArchived"] = archived;
+                node["lastUpdatedAt"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                changed = true;
+            }
+
+            if (root["archivedComposers"] is not JsonArray archivedList || root["allComposers"] is not JsonArray activeList)
+                continue;
+
+            var destination = archived ? archivedList : activeList;
+            var source = archived ? activeList : archivedList;
+            if (IndexOfComposer(destination, id) >= 0)
+                continue;
+            var sourceIndex = IndexOfComposer(source, id);
+            if (sourceIndex < 0)
+                continue;
+
+            var moving = source[sourceIndex]?.DeepClone();
+            source.RemoveAt(sourceIndex);
+            if (moving is not null)
+                destination.Add(moving);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static JsonObject? FindComposer(JsonObject? root, string composerId)
+    {
+        if (root is null)
+            return null;
+        foreach (var name in new[] { "allComposers", "archivedComposers" })
+        {
+            if (root[name] is not JsonArray composers)
+                continue;
+            var match = composers.OfType<JsonObject>().FirstOrDefault(node =>
+                string.Equals(node["composerId"]?.GetValue<string>(), composerId, StringComparison.OrdinalIgnoreCase));
+            if (match is not null)
+                return match;
+        }
+
+        return null;
+    }
+
+    private static int IndexOfComposer(JsonArray composers, string composerId)
+    {
+        for (var i = 0; i < composers.Count; i++)
+        {
+            if (string.Equals(composers[i]?["composerId"]?.GetValue<string>(), composerId, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+
+        return -1;
+    }
+
+    private static bool ReadBool(JsonObject node, string name)
+    {
+        var value = node[name];
+        if (value is null)
+            return false;
+        try { return value.GetValue<bool>(); } catch { /* try other shapes */ }
+        try { return value.GetValue<long>() != 0; } catch { /* try other shapes */ }
+        try { return string.Equals(value.GetValue<string>(), "true", StringComparison.OrdinalIgnoreCase); } catch { return false; }
+    }
+
+    private static bool TableExists(SqliteConnection connection, SqliteTransaction? tx, string name)
+    {
+        using var cmd = connection.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $name LIMIT 1";
+        cmd.Parameters.AddWithValue("$name", name);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private static void TryMergeComposerHeadersTable(
+        SqliteConnection connection,
+        Dictionary<string, (string Title, string? WorkspaceId, string? WorkspacePath, string HeaderJson)> map)
+    {
+        if (!TableExists(connection, null, "composerHeaders"))
+            return;
+
+        try
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "SELECT composerId, isArchived, value FROM composerHeaders";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var id = reader.IsDBNull(0) ? null : reader.GetString(0);
+                if (string.IsNullOrWhiteSpace(id) || !AgentCatalog.IsComposerId(id))
+                    continue;
+
+                var archived = !reader.IsDBNull(1) && ToFlag(reader.GetValue(1));
+                if (map.TryGetValue(id, out var existing))
+                {
+                    if (!archived)
+                        continue;
+                    var node = TryParseObject(existing.HeaderJson) ?? new JsonObject();
+                    node["isArchived"] = true;
+                    map[id] = (existing.Title, existing.WorkspaceId, existing.WorkspacePath, node.ToJsonString());
+                    continue;
+                }
+
+                var valueJson = reader.FieldCount > 2 && !reader.IsDBNull(2) ? reader.GetValue(2)?.ToString() : null;
+                var header = TryParseObject(valueJson) ?? new JsonObject();
+                header["composerId"] = id;
+                if (archived)
+                    header["isArchived"] = true;
+                var title = header["name"]?.GetValue<string>() ?? "Untitled agent";
+                string? workspaceId = null;
+                string? workspacePath = null;
+                if (header["workspaceIdentifier"] is JsonObject ident)
+                {
+                    workspaceId = ident["id"]?.GetValue<string>();
+                    workspacePath = ident["uri"]?["fsPath"]?.GetValue<string>()
+                        ?? CursorWorkspaceLocator.TryFolderPath(ident["uri"]?["external"]?.GetValue<string>() ?? "");
+                }
+
+                map[id] = (title, workspaceId, workspacePath, header.ToJsonString());
+            }
+        }
+        catch
+        {
+            // Schema varies between Cursor builds.
+        }
+    }
+
+    private static void TrySetComposerHeadersTable(
+        SqliteConnection connection,
+        SqliteTransaction tx,
+        HashSet<string> ids,
+        bool archived)
+    {
+        if (!TableExists(connection, tx, "composerHeaders"))
+            return;
+
+        try
+        {
+            foreach (var id in ids)
+            {
+                using var cmd = connection.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = "UPDATE composerHeaders SET isArchived = $flag WHERE composerId = $id";
+                cmd.Parameters.AddWithValue("$flag", archived ? 1 : 0);
+                cmd.Parameters.AddWithValue("$id", id);
+                cmd.ExecuteNonQuery();
+            }
+        }
+        catch
+        {
+            // ItemTable JSON is the fallback index.
+        }
+
+        try
+        {
+            foreach (var id in ids)
+            {
+                using var read = connection.CreateCommand();
+                read.Transaction = tx;
+                read.CommandText = "SELECT value FROM composerHeaders WHERE composerId = $id";
+                read.Parameters.AddWithValue("$id", id);
+                var raw = read.ExecuteScalar()?.ToString();
+                var node = TryParseObject(raw);
+                if (node is null)
+                    continue;
+                node["isArchived"] = archived;
+                using var write = connection.CreateCommand();
+                write.Transaction = tx;
+                write.CommandText = "UPDATE composerHeaders SET value = $value WHERE composerId = $id";
+                write.Parameters.AddWithValue("$value", node.ToJsonString());
+                write.Parameters.AddWithValue("$id", id);
+                write.ExecuteNonQuery();
+            }
+        }
+        catch
+        {
+            // value column is optional.
+        }
+    }
+
+    private static void TryDeleteComposerHeadersTable(
+        SqliteConnection connection,
+        SqliteTransaction tx,
+        HashSet<string> ids)
+    {
+        if (!TableExists(connection, tx, "composerHeaders"))
+            return;
+
+        try
+        {
+            foreach (var id in ids)
+            {
+                using var cmd = connection.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = "DELETE FROM composerHeaders WHERE composerId = $id";
+                cmd.Parameters.AddWithValue("$id", id);
+                cmd.ExecuteNonQuery();
+            }
+        }
+        catch
+        {
+            // Best-effort companion index.
+        }
+    }
+
+    private static bool ToFlag(object value) =>
+        value switch
+        {
+            bool flag => flag,
+            byte number => number != 0,
+            short number => number != 0,
+            int number => number != 0,
+            long number => number != 0,
+            string text when bool.TryParse(text, out var flag) => flag,
+            string text when long.TryParse(text, out var number) => number != 0,
+            _ => false
+        };
 }

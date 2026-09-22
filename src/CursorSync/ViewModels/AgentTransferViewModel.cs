@@ -46,8 +46,13 @@ public partial class AgentTransferViewModel : ObservableObject
     [ObservableProperty] private string _selectionSummary = "Nothing selected";
     [ObservableProperty] private string _backupButtonText = "Back up selected";
     [ObservableProperty] private string _restoreHint = "Select a saved backup, then choose whether agents return to their original folders or one destination.";
+    [ObservableProperty] private AgentListFilter _listFilter = AgentListFilter.Active;
+
+    private int _localAgentCount;
+    private int _archivedAgentCount;
 
     partial void OnSearchTextChanged(string value) => ApplyFilter();
+    partial void OnListFilterChanged(AgentListFilter value) => ApplyFilter();
     partial void OnFocusedAgentChanged(AgentItemViewModel? value)
     {
         foreach (var agent in _allGroups.SelectMany(g => g.Agents))
@@ -170,12 +175,11 @@ public partial class AgentTransferViewModel : ObservableObject
         SelectedTargetWorkspace = TargetWorkspaces.FirstOrDefault(w => w.Id == previousTarget)
             ?? TargetWorkspaces.FirstOrDefault();
         SelectedBackup = Backups.FirstOrDefault(b => b.FolderPath == previousBackup) ?? Backups.FirstOrDefault();
+        _localAgentCount = agents.Count;
+        _archivedAgentCount = agents.Count(a => a.IsArchived);
         ApplyFilter();
-        FocusedAgent = Workspaces.SelectMany(g => g.Agents).FirstOrDefault(a => a.Id == previousFocus)
-            ?? Workspaces.SelectMany(g => g.Agents).FirstOrDefault();
-        EmptyAgentsText = agents.Count == 0
-            ? "No local agents were found. Open a chat in Cursor first, then refresh."
-            : "No workspaces match this search.";
+        FocusedAgent = Workspaces.SelectMany(g => g.VisibleAgents).FirstOrDefault(a => a.Id == previousFocus)
+            ?? Workspaces.SelectMany(g => g.VisibleAgents).FirstOrDefault();
     }
 
     [RelayCommand]
@@ -473,6 +477,58 @@ public partial class AgentTransferViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private void ArchiveSelectedAgents() => ConfirmArchiveChange(archived: true);
+
+    [RelayCommand]
+    private void UnarchiveSelectedAgents() => ConfirmArchiveChange(archived: false);
+
+    private void ConfirmArchiveChange(bool archived)
+    {
+        var selected = SelectedAgents();
+        if (selected.Count == 0)
+        {
+            _host.Notify(archived
+                ? "Check one or more chats to archive."
+                : "Check one or more archived chats to restore.", "warn");
+            return;
+        }
+
+        if (archived && selected.All(agent => agent.IsArchived))
+        {
+            _host.Notify("Those chats are already archived. Switch to Archived to restore or delete them.", "warn");
+            return;
+        }
+
+        if (!archived && selected.All(agent => !agent.IsArchived))
+        {
+            _host.Notify("Those chats are already in the active list.", "warn");
+            return;
+        }
+
+        var names = selected.Count == 1
+            ? $"“{selected[0].Title}”"
+            : $"{selected.Count} chats";
+        var scope = selected
+            .Select(agent => agent.WorkspaceLabel ?? "Unknown workspace")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var where = scope.Count == 1 ? $" in {scope[0]}" : $" across {scope.Count} workspaces";
+
+        _host.Confirm(
+            archived
+                ? (selected.Count == 1 ? "Archive this chat?" : "Archive these chats?")
+                : (selected.Count == 1 ? "Restore this archived chat?" : "Restore these archived chats?"),
+            archived
+                ? $"{names}{where} will leave Cursor’s Agents list and move to Archived. Transcripts and memory stay on disk. Close Cursor so the list can update."
+                : $"{names}{where} will return to Cursor’s Agents list. Close Cursor so the list can update.",
+            () => _ = SetArchivedAsync(selected, archived),
+            CursorRisk.Medium,
+            archived
+                ? (selected.Count == 1 ? "Archive chat" : "Archive chats")
+                : (selected.Count == 1 ? "Restore chat" : "Restore chats"));
+    }
+
+    [RelayCommand]
     private void OpenBackupFolder()
     {
         Directory.CreateDirectory(_store.AgentBackupsFolder);
@@ -538,30 +594,57 @@ public partial class AgentTransferViewModel : ObservableObject
         Workspaces.Clear();
         foreach (var group in _allGroups)
         {
-            group.ApplyFilter(query);
+            group.ApplyFilter(query, ListFilter);
             if (group.IsVisible)
                 Workspaces.Add(group);
         }
 
         ShowEmptyAgents = Workspaces.Count == 0;
-        if (FocusedAgent is not null && Workspaces.SelectMany(g => g.Agents).All(a => a != FocusedAgent))
-            FocusedAgent = Workspaces.SelectMany(g => g.Agents).FirstOrDefault();
+        UpdateEmptyAgentsText();
+        if (FocusedAgent is not null && Workspaces.SelectMany(g => g.VisibleAgents).All(a => a != FocusedAgent))
+            FocusedAgent = Workspaces.SelectMany(g => g.VisibleAgents).FirstOrDefault();
         UpdateSelectionSummary();
     }
 
+    private void UpdateEmptyAgentsText()
+    {
+        if (_localAgentCount == 0)
+        {
+            EmptyAgentsText = "No local agents were found. Open a chat in Cursor first, then refresh.";
+            return;
+        }
+
+        if (ListFilter == AgentListFilter.Archived && _archivedAgentCount == 0 && string.IsNullOrWhiteSpace(SearchText))
+        {
+            EmptyAgentsText = "No archived chats. Archive a chat in Cursor’s Agents window, or archive checked chats here.";
+            return;
+        }
+
+        if (ListFilter == AgentListFilter.Active && _archivedAgentCount == _localAgentCount && string.IsNullOrWhiteSpace(SearchText))
+        {
+            EmptyAgentsText = "Every chat on this PC is archived. Switch to Archived to restore or delete them.";
+            return;
+        }
+
+        EmptyAgentsText = "No chats match this search.";
+    }
+
     private List<AgentRecord> SelectedAgents() =>
-        _allGroups.SelectMany(g => g.Agents).Where(a => a.IsSelected).Select(a => a.Record).ToList();
+        Workspaces.SelectMany(g => g.VisibleAgents).Where(a => a.IsSelected).Select(a => a.Record).ToList();
 
     private void UpdateSelectionSummary()
     {
-        var agents = _allGroups.SelectMany(g => g.Agents).Where(a => a.IsSelected).ToList();
+        var agents = Workspaces.SelectMany(g => g.VisibleAgents).Where(a => a.IsSelected).ToList();
         var workspaces = agents
             .Select(a => a.Record.WorkspaceId ?? a.Record.WorkspaceLabel)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Count();
+        var archived = agents.Count(a => a.Record.IsArchived);
         SelectionSummary = agents.Count == 0
             ? "Nothing selected"
-            : $"{workspaces} workspace{(workspaces == 1 ? "" : "s")} · {agents.Count} agent{(agents.Count == 1 ? "" : "s")}";
+            : archived == 0
+                ? $"{workspaces} workspace{(workspaces == 1 ? "" : "s")} · {agents.Count} agent{(agents.Count == 1 ? "" : "s")}"
+                : $"{workspaces} workspace{(workspaces == 1 ? "" : "s")} · {agents.Count} agent{(agents.Count == 1 ? "" : "s")} ({archived} archived)";
         BackupButtonText = agents.Count == 0
             ? "Back up selected"
             : $"Back up {SelectionSummary}";
@@ -789,6 +872,51 @@ public partial class AgentTransferViewModel : ObservableObject
         }
     }
 
+    private async Task SetArchivedAsync(List<AgentRecord> agents, bool archived)
+    {
+        try
+        {
+            if (!await EnsureCursorClosedForDatabaseAsync())
+                return;
+
+            AgentTransferResult? result = null;
+            var verb = archived ? "Archiving chats" : "Restoring archived chats";
+            var guard = await _host.GuardAsync(
+                verb,
+                IntegrityPlan.ArchiveAgents(agents.Count),
+                async () =>
+                {
+                    result = await ExecuteAsync(archived ? "Archiving chats…" : "Restoring archived chats…", progress =>
+                        _transfer.SetArchived(agents, CursorPaths.FromSettings(_host.Settings), archived, progress, CancellationToken.None));
+                    return result.Success;
+                });
+            if (!guard.Completed || result is null)
+                return;
+
+            RecordHistory(archived ? "Archive chats" : "Unarchive chats", result,
+                agents.Count == 1 ? agents[0].Title : $"{agents.Count} chats");
+            if (result.Success)
+            {
+                var extra = result.Warnings.Count > 0 ? " " + result.Warnings[0] : " Reopen Cursor to refresh the Agents list.";
+                _host.Notify(archived
+                    ? $"Archived {agents.Count} chat{(agents.Count == 1 ? "" : "s")}.{extra}"
+                    : $"Restored {agents.Count} chat{(agents.Count == 1 ? "" : "s")} from the archive.{extra}",
+                    result.Warnings.Count > 0 ? "warn" : "success");
+                await RefreshAsync();
+                if (ListFilter != AgentListFilter.All)
+                    ListFilter = archived ? AgentListFilter.Archived : AgentListFilter.Active;
+            }
+            else
+            {
+                _host.Notify(result.Error ?? "Could not update those chats.", "error");
+            }
+        }
+        catch (Exception ex)
+        {
+            _host.Notify(UserFacingError.From(ex), "error");
+        }
+    }
+
     private void FinishRestore(AgentTransferResult result, string title)
     {
         RecordHistory("Workspace restore", result, title);
@@ -958,14 +1086,21 @@ public partial class WorkspaceGroupViewModel : ObservableObject
         IsVisible = visible.Count > 0;
     }
 
-    public void ApplyFilter(string query)
+    public void ApplyFilter(string query, AgentListFilter filter)
     {
         foreach (var agent in Agents)
         {
-            agent.IsVisible = query.Length == 0
+            var matchesQuery = query.Length == 0
                 || agent.Title.Contains(query, StringComparison.OrdinalIgnoreCase)
                 || Label.Contains(query, StringComparison.OrdinalIgnoreCase)
                 || FolderPath.Contains(query, StringComparison.OrdinalIgnoreCase);
+            var matchesArchive = filter switch
+            {
+                AgentListFilter.Active => !agent.Record.IsArchived,
+                AgentListFilter.Archived => agent.Record.IsArchived,
+                _ => true
+            };
+            agent.IsVisible = matchesQuery && matchesArchive;
         }
         RefreshState();
     }
@@ -983,13 +1118,14 @@ public partial class AgentItemViewModel : ObservableObject
         Title = record.Title;
         WorkspaceLabel = record.WorkspaceLabel ?? "Unknown workspace";
         Detail = $"{record.LastWriteUtc.ToLocalTime():g} · {FileSizeFormatter.FromBytes(record.Bytes)}";
-        Meta = record.HasStore || record.HasWaypoints
-            ? string.Join(" · ", new[]
-            {
-                record.HasStore ? "Store" : null,
-                record.HasWaypoints ? $"{record.WaypointDirs.Count} waypoint{(record.WaypointDirs.Count == 1 ? "" : "s")}" : null
-            }.Where(s => s is not null))
-            : "Transcript";
+        var bits = new List<string>();
+        if (record.IsArchived)
+            bits.Add("Archived");
+        if (record.HasStore)
+            bits.Add("Store");
+        if (record.HasWaypoints)
+            bits.Add($"{record.WaypointDirs.Count} waypoint{(record.WaypointDirs.Count == 1 ? "" : "s")}");
+        Meta = bits.Count > 0 ? string.Join(" · ", bits) : "Transcript";
         HasStore = record.HasStore;
         HasWaypoints = record.HasWaypoints;
         IsVisible = true;

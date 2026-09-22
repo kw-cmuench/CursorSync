@@ -29,6 +29,7 @@ public sealed class AgentRecord
     public int Files { get; init; }
     public bool HasStore { get; init; }
     public bool HasWaypoints { get; init; }
+    public bool IsArchived { get; init; }
     public string? HeaderJson { get; init; }
 }
 

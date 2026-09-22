@@ -369,8 +369,33 @@ public static class AgentCatalog
             Files = files,
             HasStore = !string.IsNullOrWhiteSpace(builder.StoreDir),
             HasWaypoints = builder.WaypointDirs.Count > 0,
+            IsArchived = LooksArchived(builder.HeaderJson),
             HeaderJson = builder.HeaderJson
         };
+    }
+
+    private static bool LooksArchived(string? headerJson)
+    {
+        if (string.IsNullOrWhiteSpace(headerJson))
+            return false;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(headerJson);
+            if (!doc.RootElement.TryGetProperty("isArchived", out var prop))
+                return false;
+            return prop.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.Number => prop.TryGetInt64(out var number) && number != 0,
+                JsonValueKind.String => bool.TryParse(prop.GetString(), out var flag) && flag,
+                _ => false
+            };
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static void Measure(string? path, ref int files, ref long bytes)
